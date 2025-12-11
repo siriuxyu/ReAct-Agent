@@ -1,0 +1,30 @@
+# Secrets and local config
+.env
+.env.*
+
+# Vector DB data (mounted at runtime, not baked into image)
+chroma_db_data/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test/dev artifacts
+.pytest_cache/
+tests/
+
+# Git and docs
+.git/
+docs/
+
+# Reports and benchmark results
+Report/
+benchmark/eval_results/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
