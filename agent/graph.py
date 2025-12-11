@@ -218,9 +218,19 @@ async def call_model(
         }
     })
     
+    # Context compression: summarize old messages when conversation grows long
+    from agent.summarizer import needs_compression, compress_messages
+    messages_to_use = state.messages
+    if needs_compression(state.messages):
+        logger.info("Compressing long context", extra={
+            'function': 'call_model',
+            'details': {'message_count': len(state.messages)}
+        })
+        messages_to_use = await compress_messages(state.messages, model=context.model)
+
     # Prepare invocation messages
-    invoke_messages = [{"role": "system", "content": system_message}, *state.messages]
-    
+    invoke_messages = [{"role": "system", "content": system_message}, *messages_to_use]
+
     # Note: Web search tool is stored in model._anthropic_web_search if enabled
     # The bind_tools method handles custom tools, but web search needs special handling
     # For now, we'll rely on the model's internal mechanism to handle web search
