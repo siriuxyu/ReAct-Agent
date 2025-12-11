@@ -72,6 +72,30 @@ def normalize_text(value: Any) -> str:
     return s
 
 
+def compute_token_f1(prediction: str, reference: str) -> float:
+    """Compute token-level F1 between prediction and reference strings.
+
+    Soft match metric that rewards partial overlap, used alongside the strict
+    substring check in benchmark scoring.
+    """
+    pred_tokens = normalize_text(prediction).split()
+    ref_tokens = normalize_text(reference).split()
+
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    pred_counts: Counter = Counter(pred_tokens)
+    ref_counts: Counter = Counter(ref_tokens)
+
+    common = sum((pred_counts & ref_counts).values())
+    if common == 0:
+        return 0.0
+
+    precision = common / sum(pred_counts.values())
+    recall = common / sum(ref_counts.values())
+    return 2 * precision * recall / (precision + recall)
+
+
 def extract_tools_from_messages(messages: List[Dict[str, Any]]) -> List[str]:
     """Collect tool names from a list of messages returned by the agent."""
     tools: List[str] = []
@@ -216,12 +240,14 @@ def process_conversation(
         total_tool_calls_this_turn = len(tools_this_turn)
 
         ans_ok: Optional[bool] = None
+        token_f1_score: Optional[float] = None
         exp_content = expected_msg.get("content") if expected_msg else None
         if evaluate_answers and expected_msg and exp_content:
             answers_expected += 1
             exp_norm = normalize_text(exp_content)
             resp_norm = normalize_text(final_response)
             ans_ok = bool(exp_norm) and exp_norm in resp_norm
+            token_f1_score = compute_token_f1(final_response, exp_content)
             if ans_ok:
                 answers_correct += 1
 
@@ -232,6 +258,7 @@ def process_conversation(
                 "expected_answer": exp_content,
                 "final_response": final_response,
                 "answer_correct": ans_ok,
+                "token_f1": token_f1_score,
                 "latency_sec": latency,
                 "used_tools": used_tools_unique,
                 "tool_call_counts": dict(tool_call_counts),  # Count per tool type
@@ -820,10 +847,12 @@ def run_locomo_benchmark(
             ans_ok = None
             adv_ok = None
 
+            token_f1_score = None
             if answer_present and expected_answer is not None:
                 answerable_total += 1
                 exp_norm = normalize_text(expected_answer)
                 ans_ok = bool(exp_norm) and exp_norm in resp_norm
+                token_f1_score = compute_token_f1(final_response, expected_answer)
                 if ans_ok:
                     answerable_correct += 1
                     by_category_correct[category] += 1
@@ -846,6 +875,7 @@ def run_locomo_benchmark(
                     "evidence": evidence_ids,
                     "final_response": final_response,
                     "answer_correct": ans_ok,
+                    "token_f1": token_f1_score,
                     "adversarial_avoided": adv_ok,
                     "latency_sec": latency,
                 }
