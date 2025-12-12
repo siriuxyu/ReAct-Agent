@@ -21,8 +21,8 @@ def test_embed_text_cache_hit_skips_api():
     )
     svc.client = mock_client
 
-    result1 = asyncio.get_event_loop().run_until_complete(svc.embed_text("hello world"))
-    result2 = asyncio.get_event_loop().run_until_complete(svc.embed_text("hello world"))
+    result1 = asyncio.run(svc.embed_text("hello world"))
+    result2 = asyncio.run(svc.embed_text("hello world"))
 
     assert result1 == fake_embedding
     assert result2 == fake_embedding
@@ -50,8 +50,8 @@ def test_embed_text_cache_miss_calls_api():
     mock_client.embeddings.create.side_effect = responses
     svc.client = mock_client
 
-    r1 = asyncio.get_event_loop().run_until_complete(svc.embed_text("text A"))
-    r2 = asyncio.get_event_loop().run_until_complete(svc.embed_text("text B"))
+    r1 = asyncio.run(svc.embed_text("text A"))
+    r2 = asyncio.run(svc.embed_text("text B"))
 
     assert r1 == fake_a
     assert r2 == fake_b
@@ -81,9 +81,9 @@ def test_embed_text_cache_eviction():
     ]
     svc.client = mock_client
 
-    asyncio.get_event_loop().run_until_complete(svc.embed_text("a"))
-    asyncio.get_event_loop().run_until_complete(svc.embed_text("b"))
-    asyncio.get_event_loop().run_until_complete(svc.embed_text("c"))  # evicts "a"
-    asyncio.get_event_loop().run_until_complete(svc.embed_text("a"))  # cache miss
+    asyncio.run(svc.embed_text("a"))
+    asyncio.run(svc.embed_text("b"))
+    asyncio.run(svc.embed_text("c"))  # evicts "a"
+    asyncio.run(svc.embed_text("a"))  # cache miss
 
     assert mock_client.embeddings.create.call_count == 4
