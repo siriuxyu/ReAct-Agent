@@ -4,6 +4,6 @@ Extraction Module
 Export context extractor implementations.
 """
 
-from .extractor import PatternBasedContextExtractor
+from .extractor import ContextExtractor
 
-__all__ = ["PatternBasedContextExtractor"]
+__all__ = ["ContextExtractor"]
