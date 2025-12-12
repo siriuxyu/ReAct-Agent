@@ -28,31 +28,40 @@ class OpenAIEmbeddingService:
     """Embedding service using OpenAI"""
 
     def __init__(
-        self, api_key: str, model: str = "text-embedding-3-small", dimension: int = 1536
+        self, api_key: str, model: str = "text-embedding-3-small", dimension: int = 1536,
+        cache_size: int = 1024
     ):
         """Initialize OpenAI embedding service"""
         if AsyncOpenAI is None:
             raise ImportError("OpenAI library not installed. Please run `pip install openai`")
-            
+
         self.api_key = api_key
         self.model = model
         self.dimension = dimension
-        # Initialize async client
         self.client = AsyncOpenAI(api_key=self.api_key)
+        # In-process LRU cache: dict preserves insertion order (Python 3.7+)
+        self._cache: dict = {}
+        self._cache_size = cache_size
 
     async def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for a single text"""
+        """Generate embedding for a single text, with in-process LRU cache."""
+        clean = text.replace("\n", " ")
+        if clean in self._cache:
+            return self._cache[clean]
         try:
-            # Removing newlines is a best practice for embeddings
-            text = text.replace("\n", " ")
             response = await self.client.embeddings.create(
-                input=[text],
+                input=[clean],
                 model=self.model
             )
-            return response.data[0].embedding
+            embedding = response.data[0].embedding
         except Exception as e:
             logger.error(f"OpenAI embedding failed: {e}")
             raise EmbeddingError(f"OpenAI embedding error: {str(e)}")
+        # Evict oldest entry when cache is full
+        if len(self._cache) >= self._cache_size:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[clean] = embedding
+        return embedding
 
     async def embed_texts_batch(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple texts"""
