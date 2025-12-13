@@ -1,7 +1,8 @@
 import time
+import uuid
 from typing import Dict, Any, List, cast
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage, BaseMessage
 from langgraph.runtime import Runtime
 
 from agent.context import Context
@@ -82,6 +83,11 @@ async def extract_preferences(
                     'reasoning': result.reasoning
                 }
             })
+            # Persist to ChromaDB automatically (passive storage)
+            await _persist_preferences(
+                result.extracted_preferences,
+                user_id=runtime.context.user_id,
+            )
             return {"extracted_preferences": result.extracted_preferences}
         else:
             logger.debug("No preferences found", extra={'function': 'extract_preferences'})
@@ -90,3 +96,24 @@ async def extract_preferences(
     except Exception as e:
         logger.error("Error during preference extraction", exc_info=True)
         return {"extracted_preferences": []}
+
+
+async def _persist_preferences(preferences, user_id: str) -> None:
+    """Persist extracted preferences to ChromaDB as USER_PREFERENCE documents."""
+    try:
+        from agent.memory.langmem_adapter import get_langmem_manager
+        from agent.interfaces import StorageType
+        manager = get_langmem_manager()
+        for pref in preferences:
+            content = f"[{pref.preference_type.value}] {pref.content}"
+            key = f"pref_{uuid.uuid4().hex[:12]}"
+            await manager.store_user_memory(
+                user_id=user_id,
+                key=key,
+                content=content,
+                metadata={"confidence": pref.confidence, "source": "auto_extraction"},
+                document_type=StorageType.USER_PREFERENCE,
+            )
+        logger.info(f"Persisted {len(preferences)} preferences for user {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to persist preferences: {e}")
