@@ -47,6 +47,8 @@ class ReactRequest(BaseModel):
     system_prompt: Optional[str] = None
     model: Optional[str] = None
     max_search_results: Optional[int] = None
+    enable_web_search: Optional[bool] = None  # Override web search (default: from env)
+    enable_preference_extraction: Optional[bool] = None  # Override preference extraction (default: True)
 
 
 class ReactResponse(BaseModel):
@@ -66,6 +68,7 @@ class MemorySearchRequest(BaseModel):
 class MemoryStoreRequest(BaseModel):
     key: str
     content: str
+    document_type: Optional[str] = None  # e.g. "extracted_fact", "user_preference"
 
 
 ########################################################
@@ -109,12 +112,17 @@ async def invoke(req: ReactRequest):
         thread_id = req.thread_id or req.userid
         
         # Create context with optional parameters, including user_id for memory tools
-        context = Context(
+        context_kwargs = dict(
             system_prompt=req.system_prompt or "You are a helpful AI assistant.",
             model=req.model or "anthropic/claude-sonnet-4-5-20250929",
             max_search_results=req.max_search_results or 10,
             user_id=req.userid,  # Pass user_id for LangMem memory tools (NOT thread_id)
         )
+        if req.enable_web_search is not None:
+            context_kwargs["enable_web_search"] = req.enable_web_search
+        if req.enable_preference_extraction is not None:
+            context_kwargs["enable_preference_extraction"] = req.enable_preference_extraction
+        context = Context(**context_kwargs)
         
         logger.debug("Context created", extra={
             'request_id': request_id,
@@ -677,11 +685,19 @@ async def store_memory(userid: str, req: MemoryStoreRequest):
     if not is_langmem_enabled():
         raise HTTPException(status_code=503, detail="LangMem is not enabled")
     
+    from agent.interfaces import StorageType
     manager = get_langmem_manager()
+    doc_type = StorageType.LONG_TERM_CONTEXT
+    if req.document_type:
+        try:
+            doc_type = StorageType(req.document_type)
+        except ValueError:
+            pass
     success = await manager.store_user_memory(
         userid,
         key=req.key,
         content=req.content,
+        document_type=doc_type,
     )
     
     if not success:
