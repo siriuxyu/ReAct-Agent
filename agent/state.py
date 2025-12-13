@@ -60,3 +60,4 @@ class State(InputState):
     # extracted_entities: Dict[str, Any] = field(default_factory=dict)
     # api_connections: Dict[str, Any] = field(default_factory=dict)
     extracted_preferences: list[UserPreference] = field(default_factory=list)
+    enable_preference_extraction: bool = field(default=True)

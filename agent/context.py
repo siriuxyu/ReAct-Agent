@@ -44,6 +44,14 @@ class Context:
         },
     )
 
+    enable_preference_extraction: bool = field(
+        default=True,
+        metadata={
+            "description": "Run preference extraction after each response. "
+            "Disable for benchmark/batch use to reduce token cost."
+        },
+    )
+
     web_search_max_uses: int = field(
         default=5,
         metadata={

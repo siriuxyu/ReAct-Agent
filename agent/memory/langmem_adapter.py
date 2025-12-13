@@ -186,7 +186,7 @@ def create_chromadb_memory_tools(user_id: str, manager: "LangMemManager") -> Lis
             logger.error(f"Error in store_memory tool: {e}")
             return f"Error storing memory: {str(e)}"
     
-    return [search_memory, store_memory]
+    return [search_memory]  # store_memory removed: preferences are persisted automatically
 
 
 class LangMemManager:

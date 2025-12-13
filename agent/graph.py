@@ -197,9 +197,8 @@ async def call_model(
     # Enhance system prompt with memory search hint if LangMem is enabled
     if is_langmem_enabled() and user_id:
         system_message += (
-            "\n\nYou have access to long-term memory tools. "
-            "Use 'store_memory' to save important information the user shares. "
-            "Use 'search_memory' to recall previously stored information when relevant."
+            "\n\nYou have access to long-term memory. "
+            "Use 'search_memory' to recall relevant information from past conversations."
         )
     
     logger.debug("Prepared system prompt", extra={
@@ -236,10 +235,27 @@ async def call_model(
     # For now, we'll rely on the model's internal mechanism to handle web search
     # If web search is not working, we may need to modify how tools are passed to the API
     
-    response = cast(
-        AIMessage,
-        await model.ainvoke(invoke_messages),
-    )
+    # Invoke with retry on 429 rate-limit errors
+    _max_retries = 4
+    for _attempt in range(_max_retries):
+        try:
+            response = cast(AIMessage, await model.ainvoke(invoke_messages))
+            break
+        except Exception as _e:
+            _err_str = str(_e).lower()
+            if "429" in _err_str or "rate limit" in _err_str or "overloaded" in _err_str:
+                if _attempt < _max_retries - 1:
+                    _wait = 2 ** (_attempt + 1)  # 2s, 4s, 8s, 16s
+                    logger.warning(
+                        f"Rate limit hit (attempt {_attempt+1}/{_max_retries}), retrying in {_wait}s",
+                        extra={'function': 'call_model', 'details': {'error': str(_e)}}
+                    )
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(_wait)
+                else:
+                    raise
+            else:
+                raise
     
     model_duration_ms = (time.time() - start_time) * 1000
     
@@ -286,8 +302,11 @@ async def call_model(
             ]
         }
 
-    # Return the model's response as a list to be added to existing messages
-    return {"messages": [response]}
+    # Propagate context flag to state so route_model_output can read it
+    return {
+        "messages": [response],
+        "enable_preference_extraction": context.enable_preference_extraction,
+    }
 
 
 async def execute_tools(
@@ -369,6 +388,8 @@ def route_model_output(state: State) -> Literal["__end__", "tools", "extract_pre
     
     # If there is no tool call, then we finish
     if not has_tool_calls:
+        if not state.enable_preference_extraction:
+            return "__end__"
         logger.info("No tool calls detected, routing to preference extraction", extra={
             'function': 'route_model_output',
             'details': {'next_node': 'extract_preferences'}
