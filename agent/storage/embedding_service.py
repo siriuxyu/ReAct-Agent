@@ -4,6 +4,7 @@ Embedding Service Implementation
 Storage team can choose: OpenAI, Cohere, sentence-transformers, etc.
 """
 
+import asyncio
 import os
 import logging
 from typing import List
@@ -44,19 +45,29 @@ class OpenAIEmbeddingService:
         self._cache_size = cache_size
 
     async def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for a single text, with in-process LRU cache."""
+        """Generate embedding for a single text, with in-process LRU cache and retry."""
         clean = text.replace("\n", " ")
         if clean in self._cache:
             return self._cache[clean]
-        try:
-            response = await self.client.embeddings.create(
-                input=[clean],
-                model=self.model
-            )
-            embedding = response.data[0].embedding
-        except Exception as e:
-            logger.error(f"OpenAI embedding failed: {e}")
-            raise EmbeddingError(f"OpenAI embedding error: {str(e)}")
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.embeddings.create(
+                    input=[clean],
+                    model=self.model
+                )
+                embedding = response.data[0].embedding
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(f"OpenAI embedding failed (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {e}")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"OpenAI embedding failed after {max_retries} attempts: {e}")
+                    raise EmbeddingError(f"OpenAI embedding error: {str(e)}")
+
         # Evict oldest entry when cache is full
         if len(self._cache) >= self._cache_size:
             self._cache.pop(next(iter(self._cache)))
