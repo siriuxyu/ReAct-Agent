@@ -289,6 +289,8 @@ def call_agent(
     max_search_results: Optional[int],
     timeout: float,
     thread_id: Optional[str] = None,
+    enable_web_search: Optional[bool] = None,
+    enable_preference_extraction: Optional[bool] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Call the /invoke endpoint of the agent server.
@@ -303,6 +305,7 @@ def call_agent(
         timeout: HTTP timeout in seconds
         thread_id: Optional separate thread ID for message history (defaults to userid)
                    Use a unique thread_id per batch to avoid message history pollution.
+        enable_web_search: Override web search setting (False disables it for speed)
 
     Returns (final_response, messages_from_agent).
     """
@@ -318,6 +321,10 @@ def call_agent(
         payload["model"] = model
     if max_search_results is not None:
         payload["max_search_results"] = max_search_results
+    if enable_web_search is not None:
+        payload["enable_web_search"] = enable_web_search
+    if enable_preference_extraction is not None:
+        payload["enable_preference_extraction"] = enable_preference_extraction
 
     url = server_url.rstrip("/") + "/invoke"
     resp = requests.post(url, json=payload, timeout=timeout)
