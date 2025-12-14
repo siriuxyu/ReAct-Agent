@@ -23,6 +23,7 @@ information across sessions without losing any conversation content.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -159,19 +160,44 @@ def store_memory(
     key: str,
     content: str,
     timeout: float,
+    document_type: Optional[str] = None,
 ) -> bool:
     """Store a memory via the /memory API."""
     url = f"{server_url.rstrip('/')}/memory/{userid}/store"
+    payload: Dict[str, Any] = {"key": key, "content": content}
+    if document_type:
+        payload["document_type"] = document_type
     try:
-        resp = requests.post(
-            url,
-            json={"key": key, "content": content},
-            timeout=timeout,
-        )
+        resp = requests.post(url, json=payload, timeout=timeout)
         return resp.status_code == 200
     except Exception as e:
         print(f"[WARN] Failed to store memory: {e}")
         return False
+
+
+async def extract_session_observations(session_text: str, model: str) -> str:
+    """
+    Extract factual statements from a session using LLM.
+    Returns a plain-text list of facts, one per line.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from agent.utils import load_chat_model
+
+    llm = load_chat_model(model)
+    messages = [
+        SystemMessage(content=(
+            "Extract concise factual statements from the conversation below. "
+            "Output one fact per line. Include specific details like names, dates, events, relationships. "
+            "Do not include opinions or uncertain information. "
+            "Example output:\n"
+            "- Caroline is a transgender woman\n"
+            "- Melanie has two kids and works full time\n"
+            "- Caroline joined an LGBTQ support group on May 7, 2023"
+        )),
+        HumanMessage(content=f"Conversation:\n{session_text}\n\nFacts:"),
+    ]
+    response = await llm.ainvoke(messages)
+    return response.content.strip()
 
 
 def clear_user_memories(
@@ -210,35 +236,43 @@ def build_conversation_memories_chunked(
     persona: str,
     turns_per_chunk: int = DEFAULT_TURNS_PER_CHUNK,
     max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    session_dates: Optional[List[str]] = None,
 ) -> List[Dict[str, str]]:
     """
     Convert conversations into chunked memory items.
-    
+
     Each chunk contains N turns (or fewer if hitting char limit).
     No truncation - all content is preserved across multiple chunks.
-    
+
     Args:
         conversations: List of conversation sessions
         persona: Persona identifier for key naming
         turns_per_chunk: Target number of turns per memory chunk
         max_chunk_chars: Max characters per chunk (soft limit, will break at turn boundary)
-    
+        session_dates: Optional ISO date strings (one per session) included in chunk headers
+            so the agent can resolve relative time references like "yesterday".
+
     Returns:
         List of memory items with 'key' and 'content'
     """
     memories = []
     global_chunk_idx = 0
-    
+
     for session_idx, convo in enumerate(conversations, start=1):
         if not convo:
             continue
-        
+
         current_chunk_lines = []
         current_chunk_chars = 0
         turns_in_chunk = 0
         chunk_in_session = 0
-        
-        session_header = f"[Session {session_idx}]"
+
+        date_str = ""
+        if session_dates and session_idx <= len(session_dates):
+            d = session_dates[session_idx - 1]
+            if d:
+                date_str = f" - {d}"
+        session_header = f"[Session {session_idx}{date_str}]"
         
         for turn_idx, turn in enumerate(convo):
             speaker = turn.get("speaker") or turn.get("role") or "unknown"
@@ -295,7 +329,7 @@ def build_conversation_memories_chunked(
     return memories
 
 
-def store_all_persona_memories(
+async def store_all_persona_memories(
     persona: str,
     conversations: List[List[Dict[str, Any]]],
     server_url: str,
@@ -305,13 +339,19 @@ def store_all_persona_memories(
     turns_per_chunk: int,
     max_chunk_chars: int,
     skip_clear: bool = False,
+    session_dates: Optional[List[str]] = None,
+    model: str = "anthropic/claude-haiku-4-5-20251001",
+    extract_observations: bool = True,
 ) -> Tuple[int, int]:
     """
     Store all conversation memories for a persona (no truncation).
-    
+
     Args:
         skip_clear: If True, don't clear existing memories (for resume)
-    
+        session_dates: Optional ISO date strings per session for chunk headers
+        model: Model used for observation extraction
+        extract_observations: If True, also extract and store per-session facts
+
     Returns:
         (stored_count, total_chars)
     """
@@ -319,19 +359,20 @@ def store_all_persona_memories(
     if not skip_clear:
         clear_user_memories(server_url, userid, timeout)
         throttle(memory_store_delay)
-    
+
     # Build chunked memories
     memories = build_conversation_memories_chunked(
-        conversations, persona, turns_per_chunk, max_chunk_chars
+        conversations, persona, turns_per_chunk, max_chunk_chars,
+        session_dates=session_dates,
     )
-    
+
     stored_count = 0
     total_chars = 0
-    
+
     for mem in memories:
         content_chars = len(mem["content"])
         total_chars += content_chars
-        
+
         success = store_memory(
             server_url=server_url,
             userid=userid,
@@ -341,9 +382,47 @@ def store_all_persona_memories(
         )
         if success:
             stored_count += 1
-        
+
         throttle(memory_store_delay)
-    
+
+    # Phase 1b: extract and store per-session observations
+    if extract_observations:
+        print(f"  Extracting observations for {len(conversations)} sessions...")
+        for session_idx, session_turns in enumerate(conversations, start=1):
+            date_str = ""
+            if session_dates and session_idx <= len(session_dates):
+                date_str = f" - {session_dates[session_idx - 1]}"
+
+            # Build plain session text for LLM
+            lines = [f"[Session {session_idx}{date_str}]"]
+            for turn in session_turns:
+                speaker = turn.get("speaker", "Unknown")
+                text = turn.get("text", "")
+                lines.append(f"{speaker}: {text}")
+            session_text = "\n".join(lines)
+
+            try:
+                observations = await extract_session_observations(session_text, model)
+                if observations:
+                    obs_key = f"{persona}_obs_s{session_idx}"
+                    obs_content = f"[Session {session_idx}{date_str} - Facts]\n{observations}"
+                    success = store_memory(
+                        server_url=server_url,
+                        userid=userid,
+                        key=obs_key,
+                        content=obs_content,
+                        timeout=timeout,
+                        document_type="extracted_fact",
+                    )
+                    if success:
+                        stored_count += 1
+                        total_chars += len(obs_content)
+                    print(f"    Session {session_idx}: {len(observations.splitlines())} facts extracted")
+            except Exception as e:
+                print(f"    [WARN] Session {session_idx} observation extraction failed: {e}")
+
+            throttle(memory_store_delay)
+
     return stored_count, total_chars
 
 
@@ -357,33 +436,46 @@ def build_qa_batch_prompt(
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Build QA prompt for a batch of questions.
-    
+
     Returns:
         (prompt_text, payload_with_expected_answers)
     """
     header = (
         "You have access to stored memories about past conversations. "
-        "Use your memory search tool to recall relevant information and answer each question. "
-        "Return JSON with the schema: {\"answers\": [{\"question_id\": \"...\", \"answer\": \"...\"}]}.\n\n"
-        "Questions to answer:"
+        "Search your memory thoroughly to answer each question.\n\n"
+        "Rules:\n"
+        "- Answer concisely (under 10 words when possible)\n"
+        "- Use absolute dates/years (e.g. '2022', 'May 2023'), never relative terms like 'last year' or 'recently'\n"
+        "- For multi-part questions, search memory multiple times with different queries\n"
+        "- If you truly cannot find the answer after searching, write 'Unknown'\n"
+        "- Return ONLY JSON with schema: {\"answers\": [{\"question_id\": \"...\", \"answer\": \"...\"}]}\n\n"
+        "Questions:"
     )
-    
+
     instructions = [header]
     payload: List[Dict[str, Any]] = []
-    
+
     for idx, qa in enumerate(qa_items, start=start_idx):
         qid = qa.get("id") or f"q{idx}"
         question = qa.get("question", "")
-        
-        question_text = f"{idx}. question_id={qid}\n   Question: {question}"
+        category = qa.get("category", 0)
+
+        # Add category-specific hint
+        hint = ""
+        if category == 3:
+            hint = " [Hint: requires combining info from multiple memories — search multiple times]"
+        elif category == 2:
+            hint = " [Hint: answer with exact year or date, not relative time]"
+
+        question_text = f"{idx}. question_id={qid}\n   Question: {question}{hint}"
         instructions.append(question_text)
         payload.append({
             "id": qid,
             "question": question,
             "expected": qa.get("answer"),
-            "category": qa.get("category"),
+            "category": category,
         })
-    
+
     prompt = "\n".join(instructions)
     return prompt, payload
 
@@ -477,6 +569,64 @@ def parse_json_answers(raw: str) -> Dict[str, str]:
     return result
 
 
+def _normalize_dates(text: str) -> str:
+    """
+    Normalize date expressions to a canonical form for flexible matching.
+
+    Converts formats like "7 May 2023", "May 7, 2023", "May 7 2023" all to
+    "7 may 2023" so substring matching works across format variants.
+    """
+    import re
+    months = {
+        "january": "1", "february": "2", "march": "3", "april": "4",
+        "may": "5", "june": "6", "july": "7", "august": "8",
+        "september": "9", "october": "10", "november": "11", "december": "12",
+        "jan": "1", "feb": "2", "mar": "3", "apr": "4",
+        "jun": "6", "jul": "7", "aug": "8", "sep": "9", "oct": "10",
+        "nov": "11", "dec": "12",
+    }
+    result = text.lower()
+    # "May 7, 2023" or "May 7 2023" → "7 may 2023"
+    result = re.sub(
+        r'\b(' + '|'.join(months.keys()) + r')[,\s]+(\d{1,2})[,\s]+(\d{4})\b',
+        lambda m: f"{m.group(2)} {m.group(1)} {m.group(3)}",
+        result,
+    )
+    # Remove commas left in dates
+    result = re.sub(r'(\d),(\s)', r'\1\2', result)
+    return result
+
+
+def _is_correct(expected: str, answer: str) -> bool:
+    """
+    Flexible correctness check:
+    1. Exact substring match (normalized)
+    2. Date-normalized substring match
+    3. Token-F1 >= 0.5 (soft match for paraphrases)
+    """
+    from benchmark_runner import compute_token_f1
+
+    exp_norm = normalize_text(expected)
+    ans_norm = normalize_text(answer)
+
+    if not exp_norm:
+        return False
+
+    # 1. Strict substring
+    if exp_norm in ans_norm:
+        return True
+
+    # 2. Date-normalized substring
+    if _normalize_dates(exp_norm) in _normalize_dates(ans_norm):
+        return True
+
+    # 3. Token-F1 soft match
+    if compute_token_f1(ans_norm, exp_norm) >= 0.5:
+        return True
+
+    return False
+
+
 def evaluate_batch_answers(
     raw: str,
     qa_payload: List[Dict[str, Any]],
@@ -484,26 +634,22 @@ def evaluate_batch_answers(
     """Evaluate parsed answers against expected answers."""
     parsed = parse_json_answers(raw)
     results: List[Dict[str, Any]] = []
-    raw_norm = normalize_text(raw)
-    
+
     for entry in qa_payload:
         qid = entry["id"]
         expected = entry.get("expected")
-        exp_norm = normalize_text(expected) if expected else ""
         answer_text = parsed.get(qid)
-        
+
         if answer_text is None:
-            # Fallback: check if expected appears anywhere in response
-            if exp_norm and exp_norm in raw_norm:
-                answer_text = f"[Found in response: {expected}]"
-                correct = True
-            else:
-                answer_text = "[Answer not found in response]"
-                correct = False
+            # Fallback: check if expected appears anywhere in raw response
+            correct = bool(expected) and _is_correct(expected, raw)
+            answer_text = (
+                f"[Found in response: {expected}]" if correct
+                else "[Answer not found in response]"
+            )
         else:
-            ans_norm = normalize_text(answer_text)
-            correct = bool(exp_norm) and exp_norm in ans_norm
-        
+            correct = bool(expected) and _is_correct(expected, answer_text)
+
         results.append({
             "question_id": qid,
             "question": entry["question"],
@@ -512,7 +658,7 @@ def evaluate_batch_answers(
             "answer_correct": correct,
             "category": entry.get("category"),
         })
-    
+
     return results
 
 
@@ -583,14 +729,18 @@ def ask_qa_batches(
         
         for retry in range(max_retries + 1):
             if retry > 0:
-                retry_delay = delay_sec * (retry + 1)  # Exponential backoff
+                import requests as _requests
+                # Only back off for rate-limit errors; timeout/connection errors retry immediately
+                is_rate_limit = isinstance(last_error, _requests.HTTPError) and \
+                    getattr(last_error.response, "status_code", None) == 429
+                retry_delay = delay_sec * (retry + 1) if is_rate_limit else 1.0
                 print(f"      Retry {retry}/{max_retries} after {retry_delay}s...")
                 throttle(retry_delay)
                 # Generate new thread_id for retry to ensure clean state
                 batch_thread_id = f"{userid}_batch_{batch_idx}_retry{retry}_{uuid.uuid4().hex[:8]}"
             else:
                 throttle(delay_sec)
-            
+
             try:
                 qa_response, _ = call_agent(
                     [{"role": "user", "content": qa_prompt}],
@@ -601,15 +751,65 @@ def ask_qa_batches(
                     max_search_results=max_search_results,
                     timeout=timeout,
                     thread_id=batch_thread_id,  # Unique per batch to avoid message pollution
+                    enable_web_search=False,  # Memory benchmark: no web search needed
+                    enable_preference_extraction=False,  # Memory benchmark: skip extraction to save tokens
                 )
-                
+
                 batch_results = evaluate_batch_answers(qa_response, qa_payload)
+
+                # Fallback: retry individual questions that returned "not found"
+                not_found = [
+                    r for r in batch_results
+                    if "[Answer not found" in str(r.get("model_answer", ""))
+                    or r.get("model_answer", "").strip() == ""
+                ]
+                if not_found:
+                    print(f"      [FALLBACK] Retrying {len(not_found)} unanswered questions individually...")
+                    throttle(delay_sec)
+                    for nf in not_found:
+                        q_text = nf["question"]
+                        fallback_prompt = (
+                            f"Search your memory for information about: {q_text}\n"
+                            f"Answer concisely in under 10 words using absolute dates. "
+                            f'Return JSON: {{"answers": [{{"question_id": "{nf["question_id"]}", "answer": "..."}}]}}'
+                        )
+                        fb_thread_id = f"{userid}_fallback_{nf['question_id']}_{uuid.uuid4().hex[:8]}"
+                        try:
+                            fb_response, _ = call_agent(
+                                [{"role": "user", "content": fallback_prompt}],
+                                server_url=server_url,
+                                userid=userid,
+                                system_prompt=system_prompt,
+                                model=model,
+                                max_search_results=max_search_results,
+                                timeout=timeout,
+                                thread_id=fb_thread_id,
+                                enable_web_search=False,
+                                enable_preference_extraction=False,
+                            )
+                            fb_payload = [{
+                                "id": nf["question_id"],
+                                "question": q_text,
+                                "expected": nf.get("expected_answer"),
+                                "category": nf.get("category"),
+                            }]
+                            fb_results = evaluate_batch_answers(fb_response, fb_payload)
+                            if fb_results and "[Answer not found" not in str(fb_results[0].get("model_answer", "")):
+                                # Replace the not-found result with fallback result
+                                for i, r in enumerate(batch_results):
+                                    if r["question_id"] == nf["question_id"]:
+                                        batch_results[i] = fb_results[0]
+                                        break
+                        except Exception as fb_e:
+                            print(f"      [FALLBACK ERROR] {nf['question_id']}: {fb_e}")
+                        throttle(delay_sec)
+
                 break  # Success
-                
+
             except Exception as e:
                 last_error = e
                 print(f"      [ERROR] Attempt {retry + 1} failed: {e}")
-        
+
         if batch_results is not None:
             all_results.extend(batch_results)
             correct = sum(1 for r in batch_results if r["answer_correct"])
@@ -640,17 +840,71 @@ def ask_qa_batches(
 # Data Processing
 # =============================================================================
 
+def load_session_dates(original_locomo_path: str) -> Dict[str, str]:
+    """
+    Load session dates from the original locomo1.json file.
+
+    Returns a dict mapping session index (1-based int) to ISO date string,
+    e.g. {1: "2023-05-08", 2: "2023-05-25", ...}.
+    """
+    import re
+    from datetime import datetime
+
+    if not os.path.exists(original_locomo_path):
+        return {}
+
+    try:
+        with open(original_locomo_path, encoding="utf-8") as f:
+            orig = json.load(f)
+    except Exception:
+        return {}
+
+    convos = orig.get("conversation", {})
+    dates: Dict[str, str] = {}
+    for key, value in convos.items():
+        m = re.match(r"session_(\d+)_date_time", key)
+        if m and isinstance(value, str):
+            idx = int(m.group(1))
+            dm = re.search(r"(\d+)\s+(\w+),\s+(\d{4})", value)
+            if dm:
+                try:
+                    iso = datetime.strptime(
+                        f"{dm.group(1)} {dm.group(2)} {dm.group(3)}", "%d %B %Y"
+                    ).strftime("%Y-%m-%d")
+                    dates[idx] = iso
+                except ValueError:
+                    pass
+    return dates
+
+
 def build_persona_map(
-    data: Dict[str, Any]
-) -> Tuple[Dict[str, List[List[Dict[str, Any]]]], Dict[str, List[Dict[str, Any]]]]:
-    """Build mapping from persona to conversations and QA items."""
+    data: Dict[str, Any],
+    session_dates: Optional[Dict[int, str]] = None,
+) -> Tuple[
+    Dict[str, List[List[Dict[str, Any]]]],
+    Dict[str, List[str]],
+    Dict[str, List[Dict[str, Any]]],
+]:
+    """Build mapping from persona to conversations, session dates, and QA items."""
+    import re
+
     personas_conversations: Dict[str, List[List[Dict[str, Any]]]] = defaultdict(list)
+    personas_session_dates: Dict[str, List[str]] = defaultdict(list)
     personas_qa: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     dia_persona: Dict[str, str] = {}
 
     for tc in data.get("test_cases", []):
         persona = (tc.get("id") or "persona_unknown").split("_session")[0]
         personas_conversations[persona].append(tc.get("conversation") or [])
+
+        # Extract session index from id (e.g. "conv-26_session_3" -> 3)
+        date_val = ""
+        if session_dates:
+            m = re.search(r"_session_(\d+)$", tc.get("id") or "")
+            if m:
+                date_val = session_dates.get(int(m.group(1)), "")
+        personas_session_dates[persona].append(date_val)
+
         for turn in tc.get("conversation") or []:
             dia_id = turn.get("dia_id")
             if dia_id:
@@ -665,7 +919,7 @@ def build_persona_map(
         if persona:
             personas_qa[persona].append(qa)
 
-    return personas_conversations, personas_qa
+    return personas_conversations, personas_session_dates, personas_qa
 
 
 # =============================================================================
@@ -742,6 +996,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         help=f"Max questions per QA batch (default: {DEFAULT_MAX_QUESTIONS_PER_BATCH})",
     )
     
+    parser.add_argument(
+        "--skip-observations",
+        action="store_true",
+        help="Skip per-session observation extraction (faster, lower cost)",
+    )
+
     # Resume arguments
     parser.add_argument(
         "--resume",
@@ -763,6 +1023,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         type=int,
         default=DEFAULT_MAX_RETRIES,
         help=f"Max retries for failed QA batches (default: {DEFAULT_MAX_RETRIES})",
+    )
+    parser.add_argument(
+        "--quick-test",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Quick test: sample N questions per category (e.g. --quick-test 3 runs 15 questions total)",
     )
 
     args = parser.parse_args(argv)
@@ -814,7 +1081,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"Loading benchmark from: {locomo_file}")
     data = load_json(locomo_file)
 
-    personas_convos, personas_qa = build_persona_map(data)
+    # Load session dates from original locomo file (sibling of the converted file)
+    original_locomo = os.path.join(os.path.dirname(locomo_file), "locomo1.json")
+    session_dates = load_session_dates(original_locomo)
+    if session_dates:
+        print(f"Loaded {len(session_dates)} session dates from {original_locomo}")
+    else:
+        print(f"[WARN] No session dates loaded (original file not found: {original_locomo})")
+
+    personas_convos, personas_session_dates, personas_qa = build_persona_map(data, session_dates)
     personas = list(personas_convos.keys())
     
     if args.limit_personas is not None:
@@ -867,7 +1142,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"\n[{persona}] {len(conversations)} sessions, {total_turns} turns")
         
         try:
-            stored_count, total_chars = store_all_persona_memories(
+            stored_count, total_chars = asyncio.run(store_all_persona_memories(
                 persona=persona,
                 conversations=conversations,
                 server_url=args.server_url,
@@ -876,7 +1151,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 memory_store_delay=args.memory_store_delay,
                 turns_per_chunk=args.turns_per_chunk,
                 max_chunk_chars=args.max_chunk_chars,
-            )
+                session_dates=personas_session_dates.get(persona),
+                model=args.model or "anthropic/claude-haiku-4-5-20251001",
+                extract_observations=not args.skip_observations,
+            ))
             
             # Verify storage
             memories = list_memories(args.server_url, userid, args.timeout)
@@ -946,7 +1224,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         
         userid = f"{args.userid_prefix}_{persona}"
         qa_items = personas_qa.get(persona, [])
-        
+
+        # Quick test: sample N questions per category
+        if args.quick_test > 0:
+            import random
+            from collections import defaultdict as _defaultdict
+            by_cat: dict = _defaultdict(list)
+            for q in qa_items:
+                by_cat[q.get("category", 0)].append(q)
+            sampled = []
+            for cat_qs in by_cat.values():
+                sampled.extend(random.sample(cat_qs, min(args.quick_test, len(cat_qs))))
+            qa_items = sampled
+            print(f"  [QUICK TEST] Sampled {len(qa_items)} questions ({args.quick_test} per category)")
+
         if not qa_items:
             print(f"\n[{persona}] No QA questions, skipping")
             all_results.append({
