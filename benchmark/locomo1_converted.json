@@ -123,7 +123,7 @@
         {
           "role": "agent_expected",
           "speaker": "Melanie",
-          "content": "Hey Caroline, since we last chatted, I've had a lot of things happening to me. I ran a charity race for mental health last Saturday \u2013 it was really rewarding. Really made me think about taking care of our minds.",
+          "content": "Hey Caroline, since we last chatted, I've had a lot of things happening to me. I ran a charity race for mental health last Saturday – it was really rewarding. Really made me think about taking care of our minds.",
           "dia_id": "D2:1"
         },
         {
@@ -165,7 +165,7 @@
         {
           "role": "user",
           "speaker": "Caroline",
-          "content": "Researching adoption agencies \u2014 it's been a dream to have a family and give a loving home to kids who need it.",
+          "content": "Researching adoption agencies — it's been a dream to have a family and give a loving home to kids who need it.",
           "dia_id": "D2:8"
         },
         {
@@ -292,7 +292,7 @@
         {
           "role": "user",
           "speaker": "Caroline",
-          "content": "Thanks, Mel! My friends, family and mentors are my rocks \u2013 they motivate me and give me the strength to push on. Here's a pic from when we met up last week!",
+          "content": "Thanks, Mel! My friends, family and mentors are my rocks – they motivate me and give me the strength to push on. Here's a pic from when we met up last week!",
           "dia_id": "D3:11"
         },
         {
@@ -740,7 +740,7 @@
         {
           "role": "agent_expected",
           "speaker": "Melanie",
-          "content": "Caroline, so glad you got the support! Your experience really brought you to where you need to be. You're gonna make a huge difference! This book I read last year reminds me to always pursue my dreams, just like you are doing!\ud83c\udf1f",
+          "content": "Caroline, so glad you got the support! Your experience really brought you to where you need to be. You're gonna make a huge difference! This book I read last year reminds me to always pursue my dreams, just like you are doing!🌟",
           "dia_id": "D7:8"
         },
         {
@@ -1634,7 +1634,7 @@
         {
           "role": "user",
           "speaker": "Caroline",
-          "content": "He's so cute! What\u2019s the funniest thing Oliver's done? And sure, check out this pic of him eating parsley! Veggies are his fave!",
+          "content": "He's so cute! What’s the funniest thing Oliver's done? And sure, check out this pic of him eating parsley! Veggies are his fave!",
           "dia_id": "D13:5"
         },
         {
@@ -1857,7 +1857,7 @@
         {
           "role": "user",
           "speaker": "Caroline",
-          "content": "I was out walking in my neighborhood when I came across this cool rainbow sidewalk for Pride Month. It was so vibrant and welcoming, I had to take a picture! It reminds us that love and acceptance are everywhere\u2014even where we least expect it.",
+          "content": "I was out walking in my neighborhood when I came across this cool rainbow sidewalk for Pride Month. It was so vibrant and welcoming, I had to take a picture! It reminds us that love and acceptance are everywhere—even where we least expect it.",
           "dia_id": "D14:23"
         },
         {
@@ -2207,7 +2207,7 @@
         {
           "role": "agent_expected",
           "speaker": "Melanie",
-          "content": "Caroline, it's got to be tough dealing with those changes. Glad you've found people who uplift and accept you! Here's to a good time at the caf\u00e9 last weekend - they even had thoughtful signs like this! It brings me so much happiness.",
+          "content": "Caroline, it's got to be tough dealing with those changes. Glad you've found people who uplift and accept you! Here's to a good time at the café last weekend - they even had thoughtful signs like this! It brings me so much happiness.",
           "dia_id": "D16:16"
         },
         {
@@ -2268,7 +2268,7 @@
         {
           "role": "user",
           "speaker": "Caroline",
-          "content": "That's great news about your friend! It can be tough, but so worth it. It's a great way to add to your family and show your love. If you ever do it, let me know \u2014 I'd love to help in any way I can.",
+          "content": "That's great news about your friend! It can be tough, but so worth it. It's a great way to add to your family and show your love. If you ever do it, let me know — I'd love to help in any way I can.",
           "dia_id": "D17:5"
         },
         {
@@ -3761,7 +3761,7 @@
       "category": 4
     },
     {
-      "question": "What precautionary sign did Melanie see at the caf\u00e9?",
+      "question": "What precautionary sign did Melanie see at the café?",
       "answer": "A sign stating that someone is not being able to leave",
       "evidence": [
         "D16:16"
@@ -4196,7 +4196,7 @@
       "adversarial_answer": "Ed Sheeran"
     },
     {
-      "question": "What precautionary sign did Caroline see at the caf\u00e9?",
+      "question": "What precautionary sign did Caroline see at the café?",
       "evidence": [
         "D16:16"
       ],
