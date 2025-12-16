@@ -1,6 +1,9 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+import asyncio
+import os
 import uuid
 import time
 from agent.graph import graph
@@ -26,10 +29,147 @@ logger = get_logger(__name__)
 from dotenv import load_dotenv
 load_dotenv()
 
+
+# ---------------------------------------------------------------------------
+# Session activity tracker
+# Maps session_id → {"userid": str, "last_activity": float (epoch seconds)}
+# ---------------------------------------------------------------------------
+_active_sessions: Dict[str, Dict[str, Any]] = {}
+_session_aliases: Dict[str, str] = {}
+_finalized_sessions: set[str] = set()
+
+SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", 1800))  # 30 min
+SESSION_SWEEP_INTERVAL  = int(os.environ.get("SESSION_SWEEP_INTERVAL",  300))   # 5 min
+
+
+def _touch_session(session_id: str, userid: str) -> None:
+    """Record or refresh the last-activity timestamp for a session."""
+    effective_session_id = _resolve_session_id(session_id)
+    _active_sessions[effective_session_id] = {
+        "userid": userid,
+        "last_activity": time.time(),
+    }
+
+
+def _resolve_session_id(session_id: str) -> str:
+    """Follow any reset/timeout aliases to the current effective session id."""
+    current = session_id
+    seen = set()
+    while current in _session_aliases and current not in seen:
+        seen.add(current)
+        current = _session_aliases[current]
+    return current
+
+
+def _has_session_messages(state: Any) -> bool:
+    return bool(state and state.values and state.values.get("messages"))
+
+
+def _roll_session_forward(session_id: str, userid: str) -> str:
+    """
+    Rotate a session to a fresh underlying thread id.
+
+    The original session_id remains usable at the API layer and is aliased to the
+    new thread, so clients effectively see a cleared session.
+    """
+    effective_session_id = _resolve_session_id(session_id)
+    replacement_session_id = _build_session_id(userid)
+
+    alias_sources = [
+        alias
+        for alias in list(_session_aliases.keys())
+        if _resolve_session_id(alias) == effective_session_id
+    ]
+    alias_sources.append(session_id)
+    alias_sources.append(effective_session_id)
+    for alias in set(alias_sources):
+        if alias != replacement_session_id:
+            _session_aliases[alias] = replacement_session_id
+
+    _active_sessions.pop(session_id, None)
+    _active_sessions.pop(effective_session_id, None)
+    _finalized_sessions.discard(replacement_session_id)
+    return replacement_session_id
+
+
+async def _expire_session(session_id: str, userid: str) -> None:
+    """Force-extract preferences then remove session from the activity tracker."""
+    effective_session_id = _resolve_session_id(session_id)
+    logger.info(
+        f"Session timeout: extracting preferences for {effective_session_id}",
+        extra={"session_id": effective_session_id, "userid": userid},
+    )
+    try:
+        state = _get_session_state(effective_session_id)
+        messages = state.values.get("messages", []) if state and state.values else []
+        if (
+            messages
+            and is_langmem_enabled()
+            and effective_session_id not in _finalized_sessions
+        ):
+            from agent.preference import force_extract_and_persist
+            n = await force_extract_and_persist(
+                messages=messages,
+                user_id=userid,
+                model="anthropic/claude-haiku-4-5-20251001",
+            )
+            _finalized_sessions.add(effective_session_id)
+            logger.info(
+                f"Timeout extraction: {n} preferences saved for {effective_session_id}"
+            )
+        replacement_session_id = _roll_session_forward(effective_session_id, userid)
+        logger.info(
+            "Session expired and rolled forward",
+            extra={
+                "session_id": effective_session_id,
+                "replacement_session_id": replacement_session_id,
+                "userid": userid,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Timeout extraction failed for {effective_session_id}: {e}")
+    finally:
+        _active_sessions.pop(session_id, None)
+        _active_sessions.pop(effective_session_id, None)
+
+
+async def _session_sweep_loop() -> None:
+    """Background task: periodically expire idle sessions."""
+    logger.info(
+        f"Session sweep started (timeout={SESSION_TIMEOUT_SECONDS}s, "
+        f"interval={SESSION_SWEEP_INTERVAL}s)"
+    )
+    while True:
+        await asyncio.sleep(SESSION_SWEEP_INTERVAL)
+        now = time.time()
+        expired = [
+            (sid, info["userid"])
+            for sid, info in list(_active_sessions.items())
+            if now - info["last_activity"] > SESSION_TIMEOUT_SECONDS
+        ]
+        if expired:
+            logger.info(f"Sweeping {len(expired)} expired sessions")
+            await asyncio.gather(*[_expire_session(sid, uid) for sid, uid in expired])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_session_sweep_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 api = FastAPI(
     title="CSE291-A Agent API",
     description="React Agent with LangMem long-term memory support",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -80,6 +220,23 @@ class MemoryStoreRequest(BaseModel):
     document_type: Optional[str] = None  # e.g. "extracted_fact", "user_preference"
 
 
+class InjectRequest(BaseModel):
+    content: str                          # Raw text to inject (conversation, notes, docs, etc.)
+    source: Optional[str] = None          # Free-form label, e.g. "chat_history", "notes"
+    session_date: Optional[str] = None    # ISO date string, annotated in chunk headers
+    chunk_size: int = 1500                # Max chars per chunk
+    extract_facts: bool = True            # Extract EXTRACTED_FACT via LLM
+    extract_preferences: bool = False     # Extract USER_PREFERENCE via LLM (off by default for raw docs)
+    model: str = "anthropic/claude-haiku-4-5-20251001"
+
+
+class InjectResponse(BaseModel):
+    chunks_stored: int
+    facts_extracted: int
+    preferences_extracted: int
+    total_chars: int
+
+
 def _build_session_id(userid: str) -> str:
     return f"{userid}_{uuid.uuid4().hex[:12]}"
 
@@ -89,12 +246,15 @@ def _is_session_owned_by_user(userid: str, session_id: str) -> bool:
 
 
 def _session_config(session_id: str) -> Dict[str, Dict[str, str]]:
-    return {"configurable": {"thread_id": session_id}}
+    return {"configurable": {"thread_id": _resolve_session_id(session_id)}}
+
+
+def _get_session_state(session_id: str) -> Any:
+    return graph.get_state(_session_config(session_id))
 
 
 def _session_exists(session_id: str) -> bool:
-    state = graph.get_state(_session_config(session_id))
-    return bool(state and state.values and state.values.get("messages"))
+    return _has_session_messages(_get_session_state(session_id))
 
 
 ########################################################
@@ -116,16 +276,21 @@ async def create_session(req: SessionCreateRequest):
             detail="session_id must match userid namespace",
         )
 
-    is_new = not _session_exists(session_id)
+    effective_session_id = _resolve_session_id(session_id)
+    is_new = not _session_exists(effective_session_id)
     logger.info(
         "Session created",
         extra={
             "userid": req.userid,
-            "session_id": session_id,
+            "session_id": effective_session_id,
             "is_new": is_new,
         },
     )
-    return SessionResponse(session_id=session_id, userid=req.userid, is_new=is_new)
+    return SessionResponse(
+        session_id=effective_session_id,
+        userid=req.userid,
+        is_new=is_new,
+    )
 
 
 ########################################################
@@ -174,10 +339,12 @@ async def invoke(req: ReactRequest):
                 status_code=400,
                 detail="session_id must match userid namespace",
             )
-        config = _session_config(session_id)
+        effective_session_id = _resolve_session_id(session_id)
+        config = _session_config(effective_session_id)
 
         # Check if this is a new session (no prior messages for this session_id)
-        is_new_session = not _session_exists(session_id)
+        existing_state = _get_session_state(effective_session_id)
+        is_new_session = not _has_session_messages(existing_state)
 
         # Build system prompt, injecting known preferences for new sessions
         base_prompt = req.system_prompt or "You are a helpful AI assistant."
@@ -201,23 +368,37 @@ async def invoke(req: ReactRequest):
             except Exception as _e:
                 logger.warning(f"Failed to inject preferences: {_e}")
 
+        # Decide whether to run preference extraction this turn.
+        # Client override takes precedence; otherwise extract every 10 human turns.
+        if req.enable_preference_extraction is not None:
+            run_extraction = req.enable_preference_extraction
+        else:
+            existing_msgs = (
+                existing_state.values.get("messages", [])
+                if existing_state and existing_state.values else []
+            )
+            from langchain_core.messages import HumanMessage as _HumanMessage
+            human_turns = sum(1 for m in existing_msgs if isinstance(m, _HumanMessage))
+            # This request adds turn N+1; extract when (N+1) is a multiple of 10
+            run_extraction = ((human_turns + 1) % 10 == 0)
+
         # Create context with optional parameters
         context_kwargs = dict(
             system_prompt=base_prompt,
             model=req.model or "anthropic/claude-sonnet-4-5-20250929",
             max_search_results=req.max_search_results or 10,
             user_id=req.userid,
+            enable_preference_extraction=run_extraction,
         )
         if req.enable_web_search is not None:
             context_kwargs["enable_web_search"] = req.enable_web_search
-        if req.enable_preference_extraction is not None:
-            context_kwargs["enable_preference_extraction"] = req.enable_preference_extraction
         context = Context(**context_kwargs)
 
         logger.debug("Context created", extra={
             'request_id': request_id,
             'user_id': req.userid,
             'session_id': session_id,
+            'effective_session_id': effective_session_id,
             'is_new_session': is_new_session,
             'details': {
                 'system_prompt': context.system_prompt[:200],
@@ -397,6 +578,7 @@ async def invoke(req: ReactRequest):
             }
         })
         
+        _touch_session(effective_session_id, req.userid)
         return ReactResponse(
             messages=response_messages,
             final_response=final_response
@@ -626,18 +808,19 @@ async def chat(req: ChatRequest):
 async def check_session_state(session_id: str):
     """Check the conversation state for a specific session."""
     try:
-        config = _session_config(session_id)
-        state = graph.get_state(config)
+        effective_session_id = _resolve_session_id(session_id)
+        state = _get_session_state(effective_session_id)
         
         if state:
             return {
                 "session_id": session_id,
+                "effective_session_id": effective_session_id,
                 "state": state.values,
                 "next_node": state.next,
                 "config": state.config
             }
         else:
-            return {"error": f"Session {session_id} not found"}
+            return {"error": f"Session {effective_session_id} not found"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -672,36 +855,53 @@ async def reset_short_term_session(
     memory_userid = userid or session_id
     
     try:
-        logger.info(f"Resetting session {session_id}", extra={
+        effective_session_id = _resolve_session_id(session_id)
+        logger.info(f"Resetting session {effective_session_id}", extra={
             'request_id': request_id,
             'user_id': memory_userid,
-            'session_id': session_id,
+            'session_id': effective_session_id,
             'preserve_memory': preserve_memory,
         })
         
-        # Clear checkpoint state by setting an empty state
-        config = _session_config(session_id)
-        
-        # Get current state
-        current_state = graph.get_state(config)
-        message_count = 0
+        current_state = _get_session_state(effective_session_id)
+        current_messages = []
         if current_state and current_state.values:
-            message_count = len(current_state.values.get("messages", []))
-        
-        # Note: LangGraph's MemorySaver doesn't have a direct "delete" method
-        # The best approach is to update the state to an empty message list
-        # or to use a new thread_id
-        
-        # If not preserving memory, also clear LangMem
+            current_messages = current_state.values.get("messages", [])
+        message_count = len(current_messages)
+
+        # Force preference extraction before wiping the session
+        prefs_extracted = 0
+        if (
+            preserve_memory
+            and userid
+            and is_langmem_enabled()
+            and current_messages
+            and effective_session_id not in _finalized_sessions
+        ):
+            from agent.preference import force_extract_and_persist
+            prefs_extracted = await force_extract_and_persist(
+                messages=current_messages,
+                user_id=userid,
+                model="anthropic/claude-haiku-4-5-20251001",
+            )
+            _finalized_sessions.add(effective_session_id)
+
+        # If not preserving memory, clear LangMem instead
         memory_cleared = False
         if not preserve_memory and is_langmem_enabled() and userid:
             manager = get_langmem_manager()
             memory_cleared = await manager.clear_user_memories(userid)
+
+        replacement_session_id = _roll_session_forward(
+            effective_session_id,
+            userid or memory_userid,
+        )
         
-        logger.info(f"Session reset for {session_id}", extra={
+        logger.info(f"Session reset for {effective_session_id}", extra={
             'request_id': request_id,
             'user_id': memory_userid,
-            'session_id': session_id,
+            'session_id': effective_session_id,
+            'replacement_session_id': replacement_session_id,
             'messages_cleared': message_count,
             'memory_cleared': memory_cleared,
         })
@@ -710,9 +910,11 @@ async def reset_short_term_session(
             "status": "success",
             "userid": userid,
             "session_id": session_id,
+            "effective_session_id": effective_session_id,
+            "replacement_session_id": replacement_session_id,
             "messages_cleared": message_count,
+            "preferences_extracted": prefs_extracted,
             "memory_cleared": memory_cleared,
-            "message": f"Session {session_id} reset. Use a new request to start fresh."
         }
         
     except Exception as e:
@@ -732,6 +934,135 @@ async def reset_user_session(userid: str, preserve_memory: bool = True):
         userid=userid,
         preserve_memory=preserve_memory,
     )
+
+
+########################################################
+# Memory injection endpoint
+########################################################
+@api.post("/memory/{userid}/inject", response_model=InjectResponse)
+async def inject_memory(userid: str, req: InjectRequest):
+    """
+    Inject raw text into a user's long-term memory.
+
+    Chunks the content, stores each chunk as LONG_TERM_CONTEXT, then optionally
+    runs LLM-based fact and/or preference extraction on the full text.
+
+    Useful for bulk-loading conversation history, documents, or notes without
+    going through the agent conversation flow.
+    """
+    if not is_langmem_enabled():
+        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+
+    from agent.interfaces import StorageType
+    from agent.memory.langmem_adapter import get_langmem_manager
+
+    manager = get_langmem_manager()
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content must not be empty")
+
+    # ── 1. Chunk and store as LONG_TERM_CONTEXT ──────────────────────────────
+    header = ""
+    if req.session_date:
+        header = f"[{req.session_date}]"
+    if req.source:
+        header = f"{header} [{req.source}]".strip() if header else f"[{req.source}]"
+
+    chunks = _split_into_chunks(content, req.chunk_size)
+    chunks_stored = 0
+    for idx, chunk in enumerate(chunks):
+        chunk_content = f"{header}\n{chunk}".strip() if header else chunk
+        key = f"inject_{userid}_{uuid.uuid4().hex[:12]}_c{idx}"
+        ok = await manager.store_user_memory(
+            user_id=userid,
+            key=key,
+            content=chunk_content,
+            metadata={"source": req.source or "inject", "chunk_index": idx},
+            document_type=StorageType.LONG_TERM_CONTEXT,
+        )
+        if ok:
+            chunks_stored += 1
+
+    # ── 2. Extract facts from the full content ────────────────────────────────
+    facts_extracted = 0
+    if req.extract_facts and chunks_stored > 0:
+        try:
+            from locomo_memory_runner import extract_session_observations
+            facts_text = await extract_session_observations(content, req.model)
+            if facts_text:
+                facts_content = f"{header}\n[Facts]\n{facts_text}".strip() if header else f"[Facts]\n{facts_text}"
+                key = f"inject_{userid}_{uuid.uuid4().hex[:12]}_facts"
+                ok = await manager.store_user_memory(
+                    user_id=userid,
+                    key=key,
+                    content=facts_content,
+                    metadata={"source": req.source or "inject", "type": "extracted_fact"},
+                    document_type=StorageType.EXTRACTED_FACT,
+                )
+                if ok:
+                    facts_extracted = len(facts_text.splitlines())
+        except Exception as e:
+            logger.warning(f"Fact extraction failed during inject for {userid}: {e}")
+
+    # ── 3. Extract preferences (optional, off by default) ────────────────────
+    preferences_extracted = 0
+    if req.extract_preferences and chunks_stored > 0:
+        try:
+            from langchain_core.messages import HumanMessage as _HM
+            from agent.preference import force_extract_and_persist
+            preferences_extracted = await force_extract_and_persist(
+                messages=[_HM(content=content)],
+                user_id=userid,
+                model=req.model,
+            )
+        except Exception as e:
+            logger.warning(f"Preference extraction failed during inject for {userid}: {e}")
+
+    logger.info(
+        f"Inject complete for {userid}",
+        extra={
+            "userid": userid,
+            "chunks_stored": chunks_stored,
+            "facts_extracted": facts_extracted,
+            "preferences_extracted": preferences_extracted,
+        },
+    )
+    return InjectResponse(
+        chunks_stored=chunks_stored,
+        facts_extracted=facts_extracted,
+        preferences_extracted=preferences_extracted,
+        total_chars=len(content),
+    )
+
+
+def _split_into_chunks(text: str, chunk_size: int) -> List[str]:
+    """Split text into chunks of at most chunk_size chars, preferring newlines."""
+    chunks, current, current_len = [], [], 0
+    for line in text.splitlines(keepends=True):
+        remaining = line
+        while remaining:
+            space_left = chunk_size - current_len
+            if space_left <= 0 and current:
+                chunks.append("".join(current))
+                current, current_len = [], 0
+                space_left = chunk_size
+
+            if len(remaining) <= space_left:
+                current.append(remaining)
+                current_len += len(remaining)
+                remaining = ""
+            else:
+                if current:
+                    chunks.append("".join(current))
+                    current, current_len = [], 0
+                    space_left = chunk_size
+                current.append(remaining[:space_left])
+                chunks.append("".join(current))
+                current, current_len = [], 0
+                remaining = remaining[space_left:]
+    if current:
+        chunks.append("".join(current))
+    return chunks
 
 
 ########################################################

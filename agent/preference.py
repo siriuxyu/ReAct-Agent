@@ -98,6 +98,38 @@ async def extract_preferences(
         return {"extracted_preferences": []}
 
 
+async def force_extract_and_persist(
+    messages: List[BaseMessage],
+    user_id: str,
+    model: str = "anthropic/claude-haiku-4-5-20251001",
+) -> int:
+    """
+    Extract preferences from a message list and persist to ChromaDB.
+    Called directly (e.g. on session reset) without going through the LangGraph node.
+    Returns the number of preferences persisted.
+    """
+    filtered = filter_messages_for_extraction(messages[-20:])
+    if not filtered:
+        return 0
+
+    llm = load_chat_model(model)
+    structured_llm = llm.with_structured_output(UserProfileUpdate)
+    msgs = [SystemMessage(content=PREFERENCE_EXTRACTION_SYSTEM_PROMPT), *filtered]
+
+    try:
+        result = cast(UserProfileUpdate, await structured_llm.ainvoke(msgs))
+        if result.extracted_preferences:
+            await _persist_preferences(result.extracted_preferences, user_id)
+            logger.info(
+                f"Force-extracted {len(result.extracted_preferences)} preferences on session end",
+                extra={"user_id": user_id},
+            )
+            return len(result.extracted_preferences)
+    except Exception as e:
+        logger.error(f"force_extract_and_persist failed: {e}")
+    return 0
+
+
 async def _persist_preferences(preferences, user_id: str) -> None:
     """Persist extracted preferences to ChromaDB as USER_PREFERENCE documents."""
     try:
