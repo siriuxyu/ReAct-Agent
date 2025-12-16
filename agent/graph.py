@@ -34,21 +34,21 @@ from .preference import extract_preferences
 # Lazy import to avoid circular imports and startup issues
 def is_langmem_enabled():
     try:
-        from .memory.langmem_adapter import is_langmem_enabled as _is_langmem_enabled
+        from .memory.memory_manager import is_langmem_enabled as _is_langmem_enabled
         return _is_langmem_enabled()
     except Exception:
         return False
 
 def is_storage_available():
     try:
-        from .memory.langmem_adapter import is_storage_available as _is_storage_available
+        from .memory.memory_manager import is_storage_available as _is_storage_available
         return _is_storage_available()
     except Exception:
         return False
 
 def get_langmem_manager():
     try:
-        from .memory.langmem_adapter import get_langmem_manager as _get_langmem_manager
+        from .memory.memory_manager import get_langmem_manager as _get_langmem_manager
         return _get_langmem_manager()
     except Exception:
         return None
