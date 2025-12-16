@@ -133,7 +133,7 @@ async def force_extract_and_persist(
 async def _persist_preferences(preferences, user_id: str) -> None:
     """Persist extracted preferences to ChromaDB as USER_PREFERENCE documents."""
     try:
-        from agent.memory.langmem_adapter import get_langmem_manager
+        from agent.memory.memory_manager import get_langmem_manager
         from agent.interfaces import StorageType
         manager = get_langmem_manager()
         for pref in preferences:

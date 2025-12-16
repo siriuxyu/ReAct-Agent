@@ -31,7 +31,7 @@ from agent.utils import get_logger
 from agent.interfaces import StorageDocument, StorageType, SearchResult
 
 if TYPE_CHECKING:
-    from .langmem_adapter import LangMemManager
+    from .memory_manager import LangMemManager
 
 logger = get_logger(__name__)
 
