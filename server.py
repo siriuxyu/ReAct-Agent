@@ -42,14 +42,23 @@ class Message(BaseModel):
 
 class ReactRequest(BaseModel):
     messages: List[Message]
-    userid: str  # Required for context history and memory tools
-    thread_id: Optional[str] = None  # Optional: separate thread_id for message history (defaults to userid)
+    userid: str        # Stable user identity — scopes long-term memory (ChromaDB)
+    session_id: Optional[str] = None  # Optional: explicit short-term session; falls back to userid
     system_prompt: Optional[str] = None
     model: Optional[str] = None
     max_search_results: Optional[int] = None
-    enable_web_search: Optional[bool] = None  # Override web search (default: from env)
-    enable_preference_extraction: Optional[bool] = None  # Override preference extraction (default: True)
+    enable_web_search: Optional[bool] = None
+    enable_preference_extraction: Optional[bool] = None
 
+
+class SessionCreateRequest(BaseModel):
+    userid: str
+    session_id: Optional[str] = None  # Optional: reuse/verify an existing session id
+
+class SessionResponse(BaseModel):
+    session_id: str
+    userid: str
+    is_new: bool  # False if session_id already existed (resume)
 
 class ReactResponse(BaseModel):
     messages: List[Dict[str, Any]]
@@ -71,15 +80,64 @@ class MemoryStoreRequest(BaseModel):
     document_type: Optional[str] = None  # e.g. "extracted_fact", "user_preference"
 
 
+def _build_session_id(userid: str) -> str:
+    return f"{userid}_{uuid.uuid4().hex[:12]}"
+
+
+def _is_session_owned_by_user(userid: str, session_id: str) -> bool:
+    return session_id == userid or session_id.startswith(f"{userid}_")
+
+
+def _session_config(session_id: str) -> Dict[str, Dict[str, str]]:
+    return {"configurable": {"thread_id": session_id}}
+
+
+def _session_exists(session_id: str) -> bool:
+    state = graph.get_state(_session_config(session_id))
+    return bool(state and state.values and state.values.get("messages"))
+
+
+########################################################
+# Session management
+########################################################
+@api.post("/sessions", response_model=SessionResponse)
+async def create_session(req: SessionCreateRequest):
+    """Create a new session or verify an existing one.
+
+    Call this before /invoke to obtain a session_id.
+    Pass the returned session_id to all subsequent /invoke calls to maintain
+    conversation history. Pass an existing session_id to resume that session.
+    Omit session_id to always get a fresh session.
+    """
+    session_id = req.session_id or _build_session_id(req.userid)
+    if not _is_session_owned_by_user(req.userid, session_id):
+        raise HTTPException(
+            status_code=400,
+            detail="session_id must match userid namespace",
+        )
+
+    is_new = not _session_exists(session_id)
+    logger.info(
+        "Session created",
+        extra={
+            "userid": req.userid,
+            "session_id": session_id,
+            "is_new": is_new,
+        },
+    )
+    return SessionResponse(session_id=session_id, userid=req.userid, is_new=is_new)
+
+
 ########################################################
 # Invoke the React Agent with user context
 ########################################################
 @api.post("/invoke", response_model=ReactResponse)
 async def invoke(req: ReactRequest):
     """Invoke the React agent with the provided messages and context.
-    
-    The userid is used to maintain conversation history for each user.
-    LangMem tools are automatically included for memory management.
+
+    userid scopes long-term memory.
+    session_id scopes short-term conversation state; if omitted, userid is used
+    as a backwards-compatible single-session fallback.
     """
     request_id = uuid.uuid4().hex
     start_time = time.time()
@@ -106,37 +164,66 @@ async def invoke(req: ReactRequest):
             'details': {'messages': [{'role': m['role'], 'content': m['content'][:100]} for m in messages]}
         })
         
-        # Use thread_id if provided, otherwise fall back to userid
-        # thread_id: for LangGraph message history (can be unique per batch)
-        # userid: for memory tools (should be consistent for same user's memories)
-        thread_id = req.thread_id or req.userid
-        
-        # Create context with optional parameters, including user_id for memory tools
+        # session_id scopes the short-term message history (LangGraph checkpoint).
+        # userid scopes long-term memory (ChromaDB) and never changes.
+        # Older clients may omit session_id; in that case, reuse userid as the
+        # single session key to preserve the legacy behavior.
+        session_id = req.session_id or req.userid
+        if not _is_session_owned_by_user(req.userid, session_id):
+            raise HTTPException(
+                status_code=400,
+                detail="session_id must match userid namespace",
+            )
+        config = _session_config(session_id)
+
+        # Check if this is a new session (no prior messages for this session_id)
+        is_new_session = not _session_exists(session_id)
+
+        # Build system prompt, injecting known preferences for new sessions
+        base_prompt = req.system_prompt or "You are a helpful AI assistant."
+        if is_new_session and is_langmem_enabled() and req.userid:
+            try:
+                from agent.interfaces import StorageType
+                manager = get_langmem_manager()
+                prefs = await manager.search_user_memory(
+                    user_id=req.userid,
+                    query="user preferences",
+                    limit=10,
+                    document_type=StorageType.USER_PREFERENCE,
+                )
+                if prefs:
+                    pref_text = "\n".join(f"- {p['content']}" for p in prefs)
+                    base_prompt += f"\n\n## Known user preferences\n{pref_text}"
+                    logger.info(
+                        f"Injected {len(prefs)} preferences into system prompt for new session",
+                        extra={"request_id": request_id, "user_id": req.userid},
+                    )
+            except Exception as _e:
+                logger.warning(f"Failed to inject preferences: {_e}")
+
+        # Create context with optional parameters
         context_kwargs = dict(
-            system_prompt=req.system_prompt or "You are a helpful AI assistant.",
+            system_prompt=base_prompt,
             model=req.model or "anthropic/claude-sonnet-4-5-20250929",
             max_search_results=req.max_search_results or 10,
-            user_id=req.userid,  # Pass user_id for LangMem memory tools (NOT thread_id)
+            user_id=req.userid,
         )
         if req.enable_web_search is not None:
             context_kwargs["enable_web_search"] = req.enable_web_search
         if req.enable_preference_extraction is not None:
             context_kwargs["enable_preference_extraction"] = req.enable_preference_extraction
         context = Context(**context_kwargs)
-        
+
         logger.debug("Context created", extra={
             'request_id': request_id,
             'user_id': req.userid,
-            'thread_id': thread_id,
+            'session_id': session_id,
+            'is_new_session': is_new_session,
             'details': {
-                'system_prompt': context.system_prompt,
+                'system_prompt': context.system_prompt[:200],
                 'model': context.model,
-                'max_search_results': context.max_search_results
             }
         })
-        
-        # Configure thread for user context history (uses thread_id, NOT userid)
-        config = {"configurable": {"thread_id": thread_id}}
         
         # Stream the response from the graph
         response_messages = []
@@ -535,52 +622,65 @@ async def chat(req: ChatRequest):
 ########################################################
 # Check state endpoint
 ########################################################
-@api.get("/state/{userid}")
-async def check_state(userid: str):
-    """Check the conversation state for a specific user."""
+@api.get("/state/session/{session_id}")
+async def check_session_state(session_id: str):
+    """Check the conversation state for a specific session."""
     try:
-        config = {"configurable": {"thread_id": userid}}
+        config = _session_config(session_id)
         state = graph.get_state(config)
         
         if state:
             return {
-                "userid": userid,
+                "session_id": session_id,
                 "state": state.values,
                 "next_node": state.next,
                 "config": state.config
             }
         else:
-            return {"error": f"User {userid} not found"}
+            return {"error": f"Session {session_id} not found"}
     except Exception as e:
         return {"error": str(e)}
+
+
+@api.get("/state/{userid}")
+async def check_state(userid: str):
+    """Legacy alias for session state, using userid as the session id."""
+    return await check_session_state(userid)
 
 
 ########################################################
 # Reset short-term session (clear conversation history)
 ########################################################
-@api.post("/reset/{userid}")
-async def reset_short_term_session(userid: str, preserve_memory: bool = True):
+@api.post("/reset/session/{session_id}")
+async def reset_short_term_session(
+    session_id: str,
+    userid: Optional[str] = None,
+    preserve_memory: bool = True,
+):
     """
-    Reset the short-term conversation history for a user.
+    Reset the short-term conversation history for a session.
     
     Args:
-        userid: The user identifier
+        session_id: The session identifier
+        userid: Optional user identifier for clearing long-term memory
         preserve_memory: If True (default), keep long-term memories intact.
                         If False, also clear LangMem memories.
     
     This clears the checkpoint state but optionally preserves long-term memories.
     """
     request_id = uuid.uuid4().hex
+    memory_userid = userid or session_id
     
     try:
-        logger.info(f"Resetting session for user {userid}", extra={
+        logger.info(f"Resetting session {session_id}", extra={
             'request_id': request_id,
-            'user_id': userid,
+            'user_id': memory_userid,
+            'session_id': session_id,
             'preserve_memory': preserve_memory,
         })
         
         # Clear checkpoint state by setting an empty state
-        config = {"configurable": {"thread_id": userid}}
+        config = _session_config(session_id)
         
         # Get current state
         current_state = graph.get_state(config)
@@ -594,13 +694,14 @@ async def reset_short_term_session(userid: str, preserve_memory: bool = True):
         
         # If not preserving memory, also clear LangMem
         memory_cleared = False
-        if not preserve_memory and is_langmem_enabled():
+        if not preserve_memory and is_langmem_enabled() and userid:
             manager = get_langmem_manager()
             memory_cleared = await manager.clear_user_memories(userid)
         
-        logger.info(f"Session reset for user {userid}", extra={
+        logger.info(f"Session reset for {session_id}", extra={
             'request_id': request_id,
-            'user_id': userid,
+            'user_id': memory_userid,
+            'session_id': session_id,
             'messages_cleared': message_count,
             'memory_cleared': memory_cleared,
         })
@@ -608,17 +709,29 @@ async def reset_short_term_session(userid: str, preserve_memory: bool = True):
         return {
             "status": "success",
             "userid": userid,
+            "session_id": session_id,
             "messages_cleared": message_count,
             "memory_cleared": memory_cleared,
-            "message": f"Session reset for user {userid}. Use a new request to start fresh."
+            "message": f"Session {session_id} reset. Use a new request to start fresh."
         }
         
     except Exception as e:
-        logger.error(f"Failed to reset session for {userid}: {e}", extra={
+        logger.error(f"Failed to reset session for {session_id}: {e}", extra={
             'request_id': request_id,
-            'user_id': userid,
+            'user_id': memory_userid,
+            'session_id': session_id,
         }, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@api.post("/reset/{userid}")
+async def reset_user_session(userid: str, preserve_memory: bool = True):
+    """Legacy alias for resetting the userid-scoped default session."""
+    return await reset_short_term_session(
+        session_id=userid,
+        userid=userid,
+        preserve_memory=preserve_memory,
+    )
 
 
 ########################################################
@@ -787,10 +900,13 @@ async def status():
             "persistent": manager.has_persistent_storage,
         },
         "endpoints": {
+            "sessions": "POST /sessions - Create a new session or verify an existing one",
             "invoke": "POST /invoke - Main agent endpoint",
             "chat": "POST /chat - Simple chat without history",
-            "state": "GET /state/{userid} - Check user state",
-            "reset": "POST /reset/{userid} - Reset user session",
+            "state_session": "GET /state/session/{session_id} - Check session state",
+            "state_legacy": "GET /state/{userid} - Check legacy userid-scoped state",
+            "reset_session": "POST /reset/session/{session_id} - Reset session state",
+            "reset_legacy": "POST /reset/{userid} - Reset legacy userid-scoped session",
             "memory_list": "GET /memory/{userid} - List user memories",
             "memory_search": "POST /memory/{userid}/search - Search memories",
             "memory_store": "POST /memory/{userid}/store - Store memory",
