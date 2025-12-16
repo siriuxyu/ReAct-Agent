@@ -5,9 +5,11 @@ Storage team can choose: OpenAI, Cohere, sentence-transformers, etc.
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import logging
-from typing import List
+from typing import List, Optional
 
 # Dependency checks
 try:
@@ -20,19 +22,31 @@ try:
 except ImportError:
     SentenceTransformer = None
 
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None
+
 from agent.interfaces import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
+# Redis embedding cache TTL: 7 days (embeddings are deterministic, safe to cache long)
+_REDIS_EMB_TTL = 7 * 24 * 3600
+_REDIS_KEY_PREFIX = "emb:"
+
 
 class OpenAIEmbeddingService:
-    """Embedding service using OpenAI"""
+    """Embedding service using OpenAI, with optional Redis cache."""
 
     def __init__(
-        self, api_key: str, model: str = "text-embedding-3-small", dimension: int = 1536,
-        cache_size: int = 1024
+        self,
+        api_key: str,
+        model: str = "text-embedding-3-small",
+        dimension: int = 1536,
+        cache_size: int = 1024,
+        redis_url: Optional[str] = None,
     ):
-        """Initialize OpenAI embedding service"""
         if AsyncOpenAI is None:
             raise ImportError("OpenAI library not installed. Please run `pip install openai`")
 
@@ -40,38 +54,80 @@ class OpenAIEmbeddingService:
         self.model = model
         self.dimension = dimension
         self.client = AsyncOpenAI(api_key=self.api_key)
-        # In-process LRU cache: dict preserves insertion order (Python 3.7+)
+
+        # Redis cache (shared across processes/instances)
+        self._redis: Optional[aioredis.Redis] = None
+        _url = redis_url or os.environ.get("REDIS_URL")
+        if _url and aioredis is not None:
+            try:
+                self._redis = aioredis.from_url(_url, decode_responses=False)
+                logger.info("Embedding cache: Redis (%s)", _url)
+            except Exception as e:
+                logger.warning("Redis embedding cache unavailable (%s), falling back to LRU", e)
+
+        # In-process LRU fallback
         self._cache: dict = {}
         self._cache_size = cache_size
+        if self._redis is None:
+            logger.info("Embedding cache: in-process LRU (size=%d)", cache_size)
+
+    def _cache_key(self, text: str) -> str:
+        h = hashlib.md5(f"{self.model}:{text}".encode()).hexdigest()
+        return f"{_REDIS_KEY_PREFIX}{h}"
+
+    async def _cache_get(self, text: str) -> Optional[List[float]]:
+        if self._redis is not None:
+            try:
+                val = await self._redis.get(self._cache_key(text))
+                if val:
+                    return json.loads(val)
+            except Exception as e:
+                logger.debug("Redis cache get failed: %s", e)
+        return self._cache.get(text)
+
+    async def _cache_set(self, text: str, embedding: List[float]) -> None:
+        if self._redis is not None:
+            try:
+                await self._redis.set(
+                    self._cache_key(text), json.dumps(embedding), ex=_REDIS_EMB_TTL
+                )
+                return
+            except Exception as e:
+                logger.debug("Redis cache set failed: %s", e)
+        # LRU eviction fallback
+        if len(self._cache) >= self._cache_size:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[text] = embedding
 
     async def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for a single text, with in-process LRU cache and retry."""
+        """Generate embedding for a single text, with cache and retry."""
         clean = text.replace("\n", " ")
-        if clean in self._cache:
-            return self._cache[clean]
+
+        cached = await self._cache_get(clean)
+        if cached is not None:
+            return cached
 
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 response = await self.client.embeddings.create(
                     input=[clean],
-                    model=self.model
+                    model=self.model,
                 )
                 embedding = response.data[0].embedding
                 break
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 1s, 2s, 4s
-                    logger.warning(f"OpenAI embedding failed (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {e}")
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"OpenAI embedding failed (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {e}"
+                    )
                     await asyncio.sleep(wait)
                 else:
                     logger.error(f"OpenAI embedding failed after {max_retries} attempts: {e}")
                     raise EmbeddingError(f"OpenAI embedding error: {str(e)}")
 
-        # Evict oldest entry when cache is full
-        if len(self._cache) >= self._cache_size:
-            self._cache.pop(next(iter(self._cache)))
-        self._cache[clean] = embedding
+        await self._cache_set(clean, embedding)
         return embedding
 
     async def embed_texts_batch(self, texts: List[str]) -> List[List[float]]:

@@ -421,9 +421,20 @@ builder.add_conditional_edges(
 builder.add_edge("tools", "call_model")
 builder.add_edge("extract_preferences", "__end__")
 
-# Set up checkpoint storage - using MemorySaver for simplicity
-logger.info("Using in-memory checkpointer")
-checkpointer = MemorySaver()
+# Set up checkpoint storage: RedisSaver if REDIS_URL is set, else MemorySaver
+_redis_url = os.environ.get("REDIS_URL")
+if _redis_url:
+    try:
+        from langgraph.checkpoint.redis import RedisSaver
+        checkpointer = RedisSaver.from_conn_string(_redis_url)
+        checkpointer.setup()  # create indexes (idempotent)
+        logger.info("Using Redis checkpointer", extra={"redis_url": _redis_url})
+    except Exception as _e:
+        logger.warning(f"Redis checkpointer unavailable ({_e}), falling back to MemorySaver")
+        checkpointer = MemorySaver()
+else:
+    logger.info("Using in-memory checkpointer (set REDIS_URL to persist sessions)")
+    checkpointer = MemorySaver()
 
 # Log storage configuration (deferred to avoid import issues)
 try:
