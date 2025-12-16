@@ -16,6 +16,18 @@ This project provides a FastAPI server for the React Agent, a LangGraph-based ag
 - **Persistent Storage**: ChromaDB vector database for long-term memory
 - **Logging**: Automatic logging to both console and file for debugging and monitoring
 
+## Benchmark Performance
+
+![Benchmark Performance](docs/benchmark_performance.png)
+
+| Metric | Phase 1 (Baseline) | Phase 2 | Improvement |
+|--------|-------------------|---------|-------------|
+| Short benchmark completion | 94.3% | **100%** | +5.7% |
+| Medium benchmark completion | 66.7% | **100%** | +33.3% |
+| Long benchmark completion | 21.4% | **100%** | **+78.6%** |
+| Long-context response quality | 2.17 / 5.0 | **4.65 / 5.0** | **+114.3%** |
+| LoCoMo cross-session recall | — | **85.2%** | 19 sessions / 419 turns |
+
 ## Quick Start
 
 ### Running the React Agent Server
