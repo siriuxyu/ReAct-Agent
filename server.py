@@ -9,7 +9,7 @@ import time
 from agent.graph import graph
 from agent.context import Context
 from agent.utils import setup_logging, get_logger
-from agent.memory.langmem_adapter import (
+from agent.memory.memory_manager import (
     get_langmem_manager,
     is_langmem_enabled,
     is_storage_available,
@@ -954,7 +954,7 @@ async def inject_memory(userid: str, req: InjectRequest):
         raise HTTPException(status_code=503, detail="LangMem is not enabled")
 
     from agent.interfaces import StorageType
-    from agent.memory.langmem_adapter import get_langmem_manager
+    from agent.memory.memory_manager import get_langmem_manager
 
     manager = get_langmem_manager()
     content = req.content.strip()
@@ -987,7 +987,7 @@ async def inject_memory(userid: str, req: InjectRequest):
     facts_extracted = 0
     if req.extract_facts and chunks_stored > 0:
         try:
-            from locomo_memory_runner import extract_session_observations
+            from benchmark.locomo_memory_runner import extract_session_observations
             facts_text = await extract_session_observations(content, req.model)
             if facts_text:
                 facts_content = f"{header}\n[Facts]\n{facts_text}".strip() if header else f"[Facts]\n{facts_text}"
