@@ -48,6 +48,9 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
 
+# Allow importing from project root (agent/, tools/, etc.)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import requests
 import re
 
@@ -968,7 +971,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     parser.add_argument(
         "--benchmark-dir",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark"),
+        default=os.path.dirname(os.path.abspath(__file__)),
         help="Directory containing benchmark JSON files (default: ./benchmark).",
     )
     parser.add_argument(

@@ -13,6 +13,9 @@ eval.py
 chroma_db_data/
 locomo_batch_results.json
 locomo_batch_results_copy.json
-scripts/
 benchmark/convert.py
 locomo_checkpoint_final_20251205_192835.json
+
+# Benchmark datasets and checked-in eval artifacts are downloaded on demand.
+benchmark/*.json
+benchmark/eval_results/*.json

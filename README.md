@@ -251,9 +251,9 @@ CSE291-A/
 │   ├── context.py             # Configurable context parameters
 │   ├── prompts.py             # System prompts
 │   ├── utils.py               # Utility functions
-│   ├── memory/                # LangMem integration
+│   ├── memory/                # Memory management
 │   │   ├── __init__.py
-│   │   └── langmem_adapter.py # LangMem manager with ChromaDB backend
+│   │   └── memory_manager.py  # Memory manager with ChromaDB backend
 │   └── storage/               # Persistent storage backends
 │       ├── __init__.py
 │       ├── vector_storage.py  # ChromaDB vector storage
@@ -276,20 +276,24 @@ CSE291-A/
 │   └── file_system_search.py  # File system operations
 ├── server.py                   # FastAPI server entry point
 ├── run_agent.py               # CLI agent runner (active)
-├── benchmark_runner.py        # Base benchmark utilities
-├── locomo_batch_runner.py     # LoCoMo batch benchmark (short-term memory)
-├── locomo_memory_runner.py    # LoCoMo memory benchmark (long-term memory)
 ├── tests/                      # Test suite
 │   ├── __init__.py
 │   ├── test_translation.py
 │   ├── test_server.py
 │   └── test_cases.py
-├── benchmark/                  # Benchmark datasets
+├── benchmark/                  # Benchmark datasets and runners
+│   ├── benchmark_runner.py    # Base benchmark utilities
+│   ├── locomo_batch_runner.py # LoCoMo batch benchmark (short-term memory)
+│   ├── locomo_memory_runner.py # LoCoMo memory benchmark (long-term memory)
 │   ├── short.json
 │   ├── medium.json
 │   ├── long.json
 │   ├── locomo1.json
 │   └── locomo1_converted.json # Converted LoCoMo format
+├── scripts/                    # Utility scripts
+│   ├── download_benchmarks.py # Download benchmark datasets
+│   ├── generate_benchmark_chart.py # Generate performance charts
+│   └── measure_recall.py      # Measure ChromaDB recall@k
 ├── chroma_db_data/            # ChromaDB persistent storage
 ├── logs/                       # Application logs
 ├── Report/                     # Project reports
@@ -518,18 +522,24 @@ Run tool usage benchmarks (short, medium, long):
 
 ```bash
 # Run short benchmark
-python benchmark_runner.py --dataset short -o short_results.json
+python benchmark/benchmark_runner.py --dataset short -o short_results.json
 
 # Run medium benchmark
-python benchmark_runner.py --dataset medium -o medium_results.json
+python benchmark/benchmark_runner.py --dataset medium -o medium_results.json
 
 # Run long benchmark
-python benchmark_runner.py --dataset long -o long_results.json
+python benchmark/benchmark_runner.py --dataset long -o long_results.json
 ```
 
 **Note**: Results require manual human judgment (see "Benchmark Evaluation Notes" below).
 
 ### Running the LoCoMo Benchmark
+
+If the benchmark JSON files are missing, regenerate them with:
+
+```bash
+python download_benchmarks.py
+```
 
 Two benchmark runners are available for testing cross-session memory:
 
@@ -539,10 +549,10 @@ Stores conversation transcripts in short-term memory and tests QA recall:
 
 ```bash
 # Run with default settings
-python locomo_batch_runner.py --limit-personas 2
+python benchmark/locomo_batch_runner.py --limit-personas 2
 
 # With custom token limits (to avoid rate limits)
-python locomo_batch_runner.py \
+python benchmark/locomo_batch_runner.py \
   --locomo-file benchmark/locomo1_converted.json \
   --server-url http://localhost:8000 \
   --limit-personas 5 \
@@ -560,10 +570,10 @@ Tests true cross-session memory by storing conversations in long-term memory:
 
 ```bash
 # Run memory benchmark
-python locomo_memory_runner.py --limit-personas 2
+python benchmark/locomo_memory_runner.py --limit-personas 2
 
 # With custom settings
-python locomo_memory_runner.py \
+python benchmark/locomo_memory_runner.py \
   --limit-personas 5 \
   --max-content-chars 2000 \
   --max-qa-chars 4000 \
