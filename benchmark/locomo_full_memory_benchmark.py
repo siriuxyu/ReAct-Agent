@@ -1,23 +1,18 @@
 #!/usr/bin/env python
 """
-LoCoMo Memory Benchmark Runner (v2 - Full Coverage with Resume Support)
+LoCoMo full memory-system benchmark runner.
 
-This runner tests cross-session memory by:
-1) Storing ALL conversation history in chunks (no truncation)
-2) Resetting short-term session while preserving long-term memory
-3) Asking QA questions in batches that require recalling from long-term memory
+This is the "store -> reset -> retrieve -> answer" benchmark path:
+1. Store all conversation history in long-term memory chunks
+2. Optionally extract per-session facts
+3. Reset short-term session state while preserving long-term memory
+4. Ask QA questions that must be answered via memory retrieval
 
-Two-phase approach:
-- Phase 1: Store all conversations for all personas (chunked storage)
-- Phase 2: Ask QA questions in batches (respecting token limits)
-
-Resume support:
-- Automatically saves checkpoint after each persona
-- Use --resume to continue from last checkpoint after interruption
-- Use --force-restart to ignore checkpoint and start fresh
-
-This properly tests the memory system's ability to persist and retrieve
-information across sessions without losing any conversation content.
+Use this script when you want the end-to-end memory benchmark.
+For the other LoCoMo scripts in this repo:
+- benchmark_runner.py: evidence-fed QA, not a true memory benchmark
+- locomo_simplified_memory_benchmark.py: simplified "preload transcript then ask" benchmark
+- locomo_full_memory_benchmark.py: full long-term memory benchmark
 """
 
 from __future__ import annotations
@@ -26,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -35,11 +31,18 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional, Set
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agent.extraction.fact_extraction import extract_session_observations
 from benchmark_runner import (
     load_json,
     normalize_text,
     call_agent,
     reset_short_term_session,
+)
+from locomo_storage_utils import (
+    build_conversation_memories_chunked,
+    build_persona_map,
 )
 
 # Chunking settings
@@ -175,31 +178,6 @@ def store_memory(
         return False
 
 
-async def extract_session_observations(session_text: str, model: str) -> str:
-    """
-    Extract factual statements from a session using LLM.
-    Returns a plain-text list of facts, one per line.
-    """
-    from langchain_core.messages import HumanMessage, SystemMessage
-    from agent.utils import load_chat_model
-
-    llm = load_chat_model(model)
-    messages = [
-        SystemMessage(content=(
-            "Extract concise factual statements from the conversation below. "
-            "Output one fact per line. Include specific details like names, dates, events, relationships. "
-            "Do not include opinions or uncertain information. "
-            "Example output:\n"
-            "- Caroline is a transgender woman\n"
-            "- Melanie has two kids and works full time\n"
-            "- Caroline joined an LGBTQ support group on May 7, 2023"
-        )),
-        HumanMessage(content=f"Conversation:\n{session_text}\n\nFacts:"),
-    ]
-    response = await llm.ainvoke(messages)
-    return response.content.strip()
-
-
 def clear_user_memories(
     server_url: str,
     userid: str,
@@ -231,102 +209,24 @@ def list_memories(
     return []
 
 
-def build_conversation_memories_chunked(
-    conversations: List[List[Dict[str, Any]]],
-    persona: str,
-    turns_per_chunk: int = DEFAULT_TURNS_PER_CHUNK,
-    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
-    session_dates: Optional[List[str]] = None,
-) -> List[Dict[str, str]]:
-    """
-    Convert conversations into chunked memory items.
-
-    Each chunk contains N turns (or fewer if hitting char limit).
-    No truncation - all content is preserved across multiple chunks.
-
-    Args:
-        conversations: List of conversation sessions
-        persona: Persona identifier for key naming
-        turns_per_chunk: Target number of turns per memory chunk
-        max_chunk_chars: Max characters per chunk (soft limit, will break at turn boundary)
-        session_dates: Optional ISO date strings (one per session) included in chunk headers
-            so the agent can resolve relative time references like "yesterday".
-
-    Returns:
-        List of memory items with 'key' and 'content'
-    """
-    memories = []
-    global_chunk_idx = 0
-
-    for session_idx, convo in enumerate(conversations, start=1):
-        if not convo:
-            continue
-
-        current_chunk_lines = []
-        current_chunk_chars = 0
-        turns_in_chunk = 0
-        chunk_in_session = 0
-
-        date_str = ""
-        if session_dates and session_idx <= len(session_dates):
-            d = session_dates[session_idx - 1]
-            if d:
-                date_str = f" - {d}"
-        session_header = f"[Session {session_idx}{date_str}]"
-        
-        for turn_idx, turn in enumerate(convo):
-            speaker = turn.get("speaker") or turn.get("role") or "unknown"
-            content = turn.get("content", "")
-            dia_id = turn.get("dia_id", "")
-            
-            if not content:
-                continue
-            
-            # Format line with optional dia_id
-            if dia_id:
-                line = f"[{dia_id}] {speaker}: {content}"
-            else:
-                line = f"{speaker}: {content}"
-            
-            line_chars = len(line) + 1  # +1 for newline
-            
-            # Check if we need to start a new chunk
-            # Conditions: exceeded turn count OR exceeded char limit
-            should_break = (
-                turns_in_chunk >= turns_per_chunk or
-                (current_chunk_chars + line_chars > max_chunk_chars and turns_in_chunk > 0)
-            )
-            
-            if should_break and current_chunk_lines:
-                # Save current chunk
-                chunk_content = session_header + "\n" + "\n".join(current_chunk_lines)
-                global_chunk_idx += 1
-                memories.append({
-                    "key": f"{persona}_s{session_idx}_c{chunk_in_session}",
-                    "content": chunk_content,
-                })
-                
-                # Reset for new chunk
-                current_chunk_lines = []
-                current_chunk_chars = 0
-                turns_in_chunk = 0
-                chunk_in_session += 1
-            
-            # Add turn to current chunk
-            current_chunk_lines.append(line)
-            current_chunk_chars += line_chars
-            turns_in_chunk += 1
-        
-        # Don't forget the last chunk of this session
-        if current_chunk_lines:
-            chunk_content = session_header + "\n" + "\n".join(current_chunk_lines)
-            global_chunk_idx += 1
-            memories.append({
-                "key": f"{persona}_s{session_idx}_c{chunk_in_session}",
-                "content": chunk_content,
-            })
-    
-    return memories
+def search_memories(
+    server_url: str,
+    userid: str,
+    query: str,
+    limit: int,
+    timeout: float,
+) -> List[Dict[str, Any]]:
+    """Search memories for a user via POST /memory/{userid}/search."""
+    url = f"{server_url.rstrip('/')}/memory/{userid}/search"
+    payload = {"query": query, "limit": limit}
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results", [])
+    except Exception as e:
+        print(f"[WARN] Failed to search memories: {e}")
+        return []
 
 
 async def store_all_persona_memories(
@@ -340,6 +240,7 @@ async def store_all_persona_memories(
     max_chunk_chars: int,
     skip_clear: bool = False,
     session_dates: Optional[List[str]] = None,
+    session_datetimes_raw: Optional[List[str]] = None,
     model: str = "anthropic/claude-haiku-4-5-20251001",
     extract_observations: bool = True,
 ) -> Tuple[int, int]:
@@ -364,12 +265,15 @@ async def store_all_persona_memories(
     memories = build_conversation_memories_chunked(
         conversations, persona, turns_per_chunk, max_chunk_chars,
         session_dates=session_dates,
+        session_datetimes_raw=session_datetimes_raw,
     )
 
     stored_count = 0
     total_chars = 0
+    total_memories = len(memories)
+    print(f"  Storing {total_memories} chunks (1s delay each, ~{total_memories}s)...")
 
-    for mem in memories:
+    for chunk_idx, mem in enumerate(memories, start=1):
         content_chars = len(mem["content"])
         total_chars += content_chars
 
@@ -382,6 +286,9 @@ async def store_all_persona_memories(
         )
         if success:
             stored_count += 1
+
+        if chunk_idx % 10 == 0 or chunk_idx == total_memories:
+            print(f"  [{chunk_idx}/{total_memories}] chunks stored", flush=True)
 
         throttle(memory_store_delay)
 
@@ -396,9 +303,13 @@ async def store_all_persona_memories(
             # Build plain session text for LLM
             lines = [f"[Session {session_idx}{date_str}]"]
             for turn in session_turns:
-                speaker = turn.get("speaker", "Unknown")
-                text = turn.get("text", "")
-                lines.append(f"{speaker}: {text}")
+                speaker = turn.get("speaker") or turn.get("role") or "Unknown"
+                text = turn.get("content") or turn.get("text", "")
+                if text:
+                    lines.append(f"{speaker}: {text}")
+                blip_caption = turn.get("blip_caption")
+                if blip_caption:
+                    lines.append(f"[image_caption] {blip_caption}")
             session_text = "\n".join(lines)
 
             try:
@@ -662,6 +573,138 @@ def evaluate_batch_answers(
     return results
 
 
+def _find_first_dia_hit_rank(
+    retrieved_results: List[Dict[str, Any]],
+    evidence: List[str],
+) -> Optional[int]:
+    """
+    Return the 1-based rank of the first retrieved result that contains any gold dia_id.
+
+    A hit is defined as a retrieved chunk whose content contains a gold evidence id,
+    stored in memories as text like "[D18:5] ...".
+    """
+    if not evidence:
+        return None
+
+    for rank, result in enumerate(retrieved_results, start=1):
+        content = str(result.get("content", ""))
+        for dia_id in evidence:
+            if f"[{dia_id}]" in content:
+                return rank
+    return None
+
+
+def _extract_dia_ids_from_results(retrieved_results: List[Dict[str, Any]]) -> List[Set[str]]:
+    """Extract dia_ids like D18:5 from retrieved chunk contents."""
+    pattern = re.compile(r"\[(D\d+:\d+)\]")
+    extracted: List[Set[str]] = []
+    for result in retrieved_results:
+        content = str(result.get("content", ""))
+        extracted.append(set(pattern.findall(content)))
+    return extracted
+
+
+def evaluate_retrieval_for_questions(
+    qa_payload: List[Dict[str, Any]],
+    *,
+    userid: str,
+    server_url: str,
+    timeout: float,
+    k_values: List[int],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Measure retrieval metrics using the raw question text as the search query.
+
+    Returns a mapping keyed by question_id. Each value contains:
+      - query_text
+      - query_source
+      - evidence
+      - first_hit_rank
+      - reciprocal_rank
+      - recall_by_k
+      - any_hit_by_k
+      - all_hit_by_k
+      - retrieved_keys (top max_k result keys)
+
+    This intentionally evaluates the retriever directly, not the agent's actual
+    emitted search_memory queries.
+    """
+    if not qa_payload or not k_values:
+        return {}
+
+    max_k = max(k_values)
+    retrieval_by_qid: Dict[str, Dict[str, Any]] = {}
+
+    for entry in qa_payload:
+        qid = entry["id"]
+        question = entry.get("question", "")
+        evidence = list(entry.get("evidence") or [])
+        category = entry.get("category")
+
+        if not evidence:
+            retrieval_by_qid[qid] = {
+                "query_source": "question_text",
+                "query_text": question,
+                "evidence": evidence,
+                "category": category,
+                "skipped": True,
+                "skip_reason": "no_evidence",
+                "first_hit_rank": None,
+                "reciprocal_rank": 0.0,
+                "recall_by_k": {str(k): 0.0 for k in k_values},
+                "any_hit_by_k": {str(k): False for k in k_values},
+                "all_hit_by_k": {str(k): False for k in k_values},
+                "dia_id_hit_by_k": {str(k): False for k in k_values},
+                "retrieved_keys": [],
+            }
+            continue
+
+        retrieved_results = search_memories(
+            server_url=server_url,
+            userid=userid,
+            query=question,
+            limit=max_k,
+            timeout=timeout,
+        )
+        # Recall is measured only against raw chunks (which carry dia_ids).
+        # Extracted-fact documents are intentionally excluded here — they are a
+        # general-purpose index layer and should not be required to contain dia_ids.
+        raw_results = [
+            r for r in retrieved_results
+            if r.get("type") != "extracted_fact"
+        ]
+        first_hit_rank = _find_first_dia_hit_rank(raw_results, evidence)
+        reciprocal_rank = 1.0 / first_hit_rank if first_hit_rank else 0.0
+        extracted_dia_ids = _extract_dia_ids_from_results(raw_results)
+        gold_evidence = set(evidence)
+        recall_by_k: Dict[str, float] = {}
+        any_hit_by_k: Dict[str, bool] = {}
+        all_hit_by_k: Dict[str, bool] = {}
+        for k in k_values:
+            top_hits = set().union(*extracted_dia_ids[:k]) if extracted_dia_ids[:k] else set()
+            matched = gold_evidence & top_hits
+            recall_by_k[str(k)] = len(matched) / len(gold_evidence) if gold_evidence else 0.0
+            any_hit_by_k[str(k)] = bool(matched)
+            all_hit_by_k[str(k)] = matched == gold_evidence and bool(gold_evidence)
+
+        retrieval_by_qid[qid] = {
+            "query_source": "question_text",
+            "query_text": question,
+            "evidence": evidence,
+            "category": category,
+            "skipped": False,
+            "first_hit_rank": first_hit_rank,
+            "reciprocal_rank": reciprocal_rank,
+            "recall_by_k": recall_by_k,
+            "any_hit_by_k": any_hit_by_k,
+            "all_hit_by_k": all_hit_by_k,
+            "dia_id_hit_by_k": any_hit_by_k,
+            "retrieved_keys": [str(r.get("key", "")) for r in retrieved_results],
+        }
+
+    return retrieval_by_qid
+
+
 def ask_qa_batches(
     userid: str,
     qa_items: List[Dict[str, Any]],
@@ -674,6 +717,7 @@ def ask_qa_batches(
     max_qa_chars: int,
     max_questions_per_batch: int,
     *,
+    retrieval_k_values: Optional[List[int]] = None,
     existing_results: Optional[List[Dict[str, Any]]] = None,
     on_batch_complete: Optional[callable] = None,
     max_retries: int = 2,
@@ -717,7 +761,18 @@ def ask_qa_batches(
         prompt_tokens = estimate_tokens(qa_prompt)
         
         print(f"    Batch {batch_idx}/{len(batches)}: {len(batch)} questions "
-              f"({prompt_chars} chars, ~{prompt_tokens} tokens)")
+              f"({prompt_chars} chars, ~{prompt_tokens} tokens)", flush=True)
+
+        for qa, payload in zip(batch, qa_payload):
+            payload["evidence"] = list(qa.get("evidence") or [])
+
+        retrieval_by_qid = evaluate_retrieval_for_questions(
+            qa_payload,
+            userid=userid,
+            server_url=server_url,
+            timeout=timeout,
+            k_values=retrieval_k_values or [1, 5, 10],
+        )
         
         # Retry logic
         batch_results = None
@@ -756,6 +811,9 @@ def ask_qa_batches(
                 )
 
                 batch_results = evaluate_batch_answers(qa_response, qa_payload)
+                for result in batch_results:
+                    qid = result["question_id"]
+                    result["retrieval"] = retrieval_by_qid.get(qid)
 
                 # Fallback: retry individual questions that returned "not found"
                 not_found = [
@@ -795,6 +853,7 @@ def ask_qa_batches(
                             }]
                             fb_results = evaluate_batch_answers(fb_response, fb_payload)
                             if fb_results and "[Answer not found" not in str(fb_results[0].get("model_answer", "")):
+                                fb_results[0]["retrieval"] = retrieval_by_qid.get(nf["question_id"])
                                 # Replace the not-found result with fallback result
                                 for i, r in enumerate(batch_results):
                                     if r["question_id"] == nf["question_id"]:
@@ -825,6 +884,7 @@ def ask_qa_batches(
                     "model_answer": f"[Error after {max_retries + 1} attempts: {last_error}]",
                     "answer_correct": False,
                     "category": qa.get("category"),
+                    "retrieval": retrieval_by_qid.get(qa["id"]),
                 })
         
         # Call the callback for checkpoint saving
@@ -837,107 +897,21 @@ def ask_qa_batches(
 
 
 # =============================================================================
-# Data Processing
-# =============================================================================
-
-def load_session_dates(original_locomo_path: str) -> Dict[str, str]:
-    """
-    Load session dates from the original locomo1.json file.
-
-    Returns a dict mapping session index (1-based int) to ISO date string,
-    e.g. {1: "2023-05-08", 2: "2023-05-25", ...}.
-    """
-    import re
-    from datetime import datetime
-
-    if not os.path.exists(original_locomo_path):
-        return {}
-
-    try:
-        with open(original_locomo_path, encoding="utf-8") as f:
-            orig = json.load(f)
-    except Exception:
-        return {}
-
-    convos = orig.get("conversation", {})
-    dates: Dict[str, str] = {}
-    for key, value in convos.items():
-        m = re.match(r"session_(\d+)_date_time", key)
-        if m and isinstance(value, str):
-            idx = int(m.group(1))
-            dm = re.search(r"(\d+)\s+(\w+),\s+(\d{4})", value)
-            if dm:
-                try:
-                    iso = datetime.strptime(
-                        f"{dm.group(1)} {dm.group(2)} {dm.group(3)}", "%d %B %Y"
-                    ).strftime("%Y-%m-%d")
-                    dates[idx] = iso
-                except ValueError:
-                    pass
-    return dates
-
-
-def build_persona_map(
-    data: Dict[str, Any],
-    session_dates: Optional[Dict[int, str]] = None,
-) -> Tuple[
-    Dict[str, List[List[Dict[str, Any]]]],
-    Dict[str, List[str]],
-    Dict[str, List[Dict[str, Any]]],
-]:
-    """Build mapping from persona to conversations, session dates, and QA items."""
-    import re
-
-    personas_conversations: Dict[str, List[List[Dict[str, Any]]]] = defaultdict(list)
-    personas_session_dates: Dict[str, List[str]] = defaultdict(list)
-    personas_qa: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    dia_persona: Dict[str, str] = {}
-
-    for tc in data.get("test_cases", []):
-        persona = (tc.get("id") or "persona_unknown").split("_session")[0]
-        personas_conversations[persona].append(tc.get("conversation") or [])
-
-        # Extract session index from id (e.g. "conv-26_session_3" -> 3)
-        date_val = ""
-        if session_dates:
-            m = re.search(r"_session_(\d+)$", tc.get("id") or "")
-            if m:
-                date_val = session_dates.get(int(m.group(1)), "")
-        personas_session_dates[persona].append(date_val)
-
-        for turn in tc.get("conversation") or []:
-            dia_id = turn.get("dia_id")
-            if dia_id:
-                dia_persona[dia_id] = persona
-
-    for qa in data.get("qa", []):
-        persona = None
-        for ev in qa.get("evidence") or []:
-            persona = dia_persona.get(ev)
-            if persona:
-                break
-        if persona:
-            personas_qa[persona].append(qa)
-
-    return personas_conversations, personas_session_dates, personas_qa
-
-
-# =============================================================================
 # Main Entry Point
 # =============================================================================
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="LoCoMo Memory Benchmark Runner v2 - Full conversation coverage with resume support"
+        description="LoCoMo full memory benchmark: store chunks, reset session, retrieve, answer, and score."
     )
     parser.add_argument(
         "--benchmark-dir",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark"),
+        default=os.path.dirname(os.path.abspath(__file__)),
     )
     parser.add_argument(
         "--locomo-file",
         default=None,
-        help="Path to locomo1_converted.json",
+        help="Path to locomo1_converted.json generated by scripts/download_benchmarks.py",
     )
     parser.add_argument("--server-url", default="http://localhost:8000")
     parser.add_argument("--model", default=None)
@@ -964,7 +938,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--limit-personas", type=int, default=None)
     parser.add_argument(
         "--output",
-        default="locomo_memory_results.json",
+        default="locomo_full_memory_results.json",
         help="Output file for results",
     )
     
@@ -1019,6 +993,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Force restart, ignoring any existing checkpoint",
     )
     parser.add_argument(
+        "--skip-phase1",
+        action="store_true",
+        help="Skip Phase 1 (memory storage) and go straight to Phase 2 QA. "
+             "Use when memories are already in ChromaDB from a previous run.",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=DEFAULT_MAX_RETRIES,
@@ -1030,6 +1010,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         default=0,
         metavar="N",
         help="Quick test: sample N questions per category (e.g. --quick-test 3 runs 15 questions total)",
+    )
+    parser.add_argument(
+        "--retrieval-k",
+        nargs="+",
+        type=int,
+        default=[1, 5, 10],
+        help="k values for retrieval Recall@k / MRR reporting (default: 1 5 10)",
     )
 
     args = parser.parse_args(argv)
@@ -1044,6 +1031,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "max_chunk_chars": args.max_chunk_chars,
         "max_qa_chars": args.max_qa_chars,
         "max_questions_per_batch": args.max_questions_per_batch,
+        "retrieval_k": args.retrieval_k,
     }
     
     # Load checkpoint if resuming
@@ -1081,15 +1069,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"Loading benchmark from: {locomo_file}")
     data = load_json(locomo_file)
 
-    # Load session dates from original locomo file (sibling of the converted file)
-    original_locomo = os.path.join(os.path.dirname(locomo_file), "locomo1.json")
-    session_dates = load_session_dates(original_locomo)
-    if session_dates:
-        print(f"Loaded {len(session_dates)} session dates from {original_locomo}")
-    else:
-        print(f"[WARN] No session dates loaded (original file not found: {original_locomo})")
-
-    personas_convos, personas_session_dates, personas_qa = build_persona_map(data, session_dates)
+    (
+        personas_convos,
+        personas_session_dates,
+        personas_session_datetimes_raw,
+        personas_qa,
+    ) = build_persona_map(data)
     personas = list(personas_convos.keys())
     
     if args.limit_personas is not None:
@@ -1124,10 +1109,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"\n{'='*60}")
     print("PHASE 1: Storing all conversations")
     print(f"{'='*60}")
-    
+
+    if args.skip_phase1:
+        print("Skipping Phase 1 (--skip-phase1): assuming memories already in ChromaDB")
+        for persona in personas:
+            phase1_completed_set.add(persona)
+
     total_chunks_stored = sum(s.get("chunks_stored", 0) for s in storage_stats.values())
     total_chars_stored = sum(s.get("chars_stored", 0) for s in storage_stats.values())
-    
+
     for persona in personas:
         # Skip if already completed in phase 1
         if persona in phase1_completed_set:
@@ -1152,6 +1142,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 turns_per_chunk=args.turns_per_chunk,
                 max_chunk_chars=args.max_chunk_chars,
                 session_dates=personas_session_dates.get(persona),
+                session_datetimes_raw=personas_session_datetimes_raw.get(persona),
                 model=args.model or "anthropic/claude-haiku-4-5-20251001",
                 extract_observations=not args.skip_observations,
             ))
@@ -1264,7 +1255,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 throttle(args.delay_sec)
                 try:
                     reset_short_term_session(
-                        args.server_url, userid, args.timeout, preserve_memory=True
+                        args.server_url, userid, args.timeout,
+                        preserve_memory=True, model=args.model,
                     )
                     print(f"  Reset short-term session (memory preserved)")
                 except Exception as exc:
@@ -1298,6 +1290,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 delay_sec=args.delay_sec,
                 max_qa_chars=args.max_qa_chars,
                 max_questions_per_batch=args.max_questions_per_batch,
+                retrieval_k_values=args.retrieval_k,
                 existing_results=existing_qa_results,
                 on_batch_complete=on_batch_complete,
                 max_retries=args.max_retries,
@@ -1351,12 +1344,49 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Category breakdown
     category_totals: Dict[Any, int] = defaultdict(int)
     category_correct: Dict[Any, int] = defaultdict(int)
+    retrieval_totals: Dict[int, int] = {k: 0 for k in args.retrieval_k}
+    retrieval_recall_sum: Dict[int, float] = {k: 0.0 for k in args.retrieval_k}
+    retrieval_any_hits: Dict[int, int] = {k: 0 for k in args.retrieval_k}
+    retrieval_all_hits: Dict[int, int] = {k: 0 for k in args.retrieval_k}
+    retrieval_rr_sum = 0.0
+    retrieval_rr_count = 0
+    retrieval_by_category: Dict[Any, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "total": 0,
+            "reciprocal_rank_sum": 0.0,
+            "recall_sum_by_k": {k: 0.0 for k in args.retrieval_k},
+            "any_hits_by_k": {k: 0 for k in args.retrieval_k},
+            "all_hits_by_k": {k: 0 for k in args.retrieval_k},
+        }
+    )
     for result in all_results:
         for qa in result.get("qa_results", []):
             cat = qa.get("category")
             category_totals[cat] += 1
             if qa.get("answer_correct"):
                 category_correct[cat] += 1
+            retrieval = qa.get("retrieval") or {}
+            if retrieval.get("skipped"):
+                continue
+            recall_by_k = retrieval.get("recall_by_k") or {}
+            any_hit_by_k = retrieval.get("any_hit_by_k") or {}
+            all_hit_by_k = retrieval.get("all_hit_by_k") or {}
+            retrieval_rr_sum += float(retrieval.get("reciprocal_rank") or 0.0)
+            retrieval_rr_count += 1
+            retrieval_by_category[cat]["total"] += 1
+            retrieval_by_category[cat]["reciprocal_rank_sum"] += float(
+                retrieval.get("reciprocal_rank") or 0.0
+            )
+            for k in args.retrieval_k:
+                retrieval_totals[k] += 1
+                retrieval_recall_sum[k] += float(recall_by_k.get(str(k), 0.0))
+                retrieval_by_category[cat]["recall_sum_by_k"][k] += float(recall_by_k.get(str(k), 0.0))
+                if any_hit_by_k.get(str(k)):
+                    retrieval_any_hits[k] += 1
+                    retrieval_by_category[cat]["any_hits_by_k"][k] += 1
+                if all_hit_by_k.get(str(k)):
+                    retrieval_all_hits[k] += 1
+                    retrieval_by_category[cat]["all_hits_by_k"][k] += 1
     
     if category_totals:
         print("\nPer-category accuracy:")
@@ -1365,6 +1395,74 @@ def main(argv: Optional[List[str]] = None) -> None:
             corr = category_correct[cat]
             pct = corr / tot * 100 if tot > 0 else 0
             print(f"  Category {cat}: {corr}/{tot} ({pct:.1f}%)")
+
+    if retrieval_rr_count > 0:
+        print("\nRetrieval metrics (question-as-query):")
+        for k in args.retrieval_k:
+            total = retrieval_totals[k]
+            recall = retrieval_recall_sum[k] / total if total > 0 else 0.0
+            any_hit = retrieval_any_hits[k] / total if total > 0 else 0.0
+            all_hit = retrieval_all_hits[k] / total if total > 0 else 0.0
+            print(f"  Recall@{k}: {recall:.1%}")
+            print(f"  AnyHit@{k}: {retrieval_any_hits[k]}/{total} ({any_hit:.1%})")
+            print(f"  AllHit@{k}: {retrieval_all_hits[k]}/{total} ({all_hit:.1%})")
+        print(f"  MRR: {retrieval_rr_sum / retrieval_rr_count:.3f}")
+
+        print("\nPer-category retrieval:")
+        for cat in sorted(retrieval_by_category.keys(), key=lambda x: (x is None, x)):
+            stats = retrieval_by_category[cat]
+            total = stats["total"]
+            if total <= 0:
+                continue
+            per_k = ", ".join(
+                f"R@{k}={stats['recall_sum_by_k'][k] / total:.1%}"
+                f"/Any@{k}={stats['any_hits_by_k'][k] / total:.1%}"
+                f"/All@{k}={stats['all_hits_by_k'][k] / total:.1%}"
+                for k in args.retrieval_k
+            )
+            mrr = stats["reciprocal_rank_sum"] / total
+            print(f"  Category {cat}: {per_k}, MRR={mrr:.3f}")
+
+    retrieval_summary = {
+        "k_values": args.retrieval_k,
+        "query_source": "question_text",
+        "questions_evaluated": retrieval_rr_count,
+        "mrr": (retrieval_rr_sum / retrieval_rr_count) if retrieval_rr_count > 0 else 0.0,
+        "recall_by_k": {
+            str(k): (retrieval_recall_sum[k] / retrieval_totals[k]) if retrieval_totals[k] > 0 else 0.0
+            for k in args.retrieval_k
+        },
+        "any_hit_by_k": {
+            str(k): (retrieval_any_hits[k] / retrieval_totals[k]) if retrieval_totals[k] > 0 else 0.0
+            for k in args.retrieval_k
+        },
+        "all_hit_by_k": {
+            str(k): (retrieval_all_hits[k] / retrieval_totals[k]) if retrieval_totals[k] > 0 else 0.0
+            for k in args.retrieval_k
+        },
+        "any_hits_count_by_k": {str(k): retrieval_any_hits[k] for k in args.retrieval_k},
+        "all_hits_count_by_k": {str(k): retrieval_all_hits[k] for k in args.retrieval_k},
+        "totals_by_k": {str(k): retrieval_totals[k] for k in args.retrieval_k},
+        "by_category": {
+            str(cat): {
+                "total": stats["total"],
+                "mrr": (stats["reciprocal_rank_sum"] / stats["total"]) if stats["total"] > 0 else 0.0,
+                "recall_by_k": {
+                    str(k): (stats["recall_sum_by_k"][k] / stats["total"]) if stats["total"] > 0 else 0.0
+                    for k in args.retrieval_k
+                },
+                "any_hit_by_k": {
+                    str(k): (stats["any_hits_by_k"][k] / stats["total"]) if stats["total"] > 0 else 0.0
+                    for k in args.retrieval_k
+                },
+                "all_hit_by_k": {
+                    str(k): (stats["all_hits_by_k"][k] / stats["total"]) if stats["total"] > 0 else 0.0
+                    for k in args.retrieval_k
+                },
+            }
+            for cat, stats in retrieval_by_category.items()
+        },
+    }
 
     summary = {
         "personas_run": len(all_results),
@@ -1375,6 +1473,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "accuracy_percent": (total_correct / total_questions * 100) if total_questions > 0 else 0,
         "category_totals": dict(category_totals),
         "category_correct": dict(category_correct),
+        "retrieval": retrieval_summary,
         "details": all_results,
     }
 
