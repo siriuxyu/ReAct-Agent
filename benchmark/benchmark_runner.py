@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Benchmark runner for the CSE291-A agent.
+General benchmark runner for the CSE291-A agent.
 
 This script knows how to run two kinds of benchmarks:
 
@@ -12,13 +12,15 @@ This script knows how to run two kinds of benchmarks:
        * whether the agent used the expected tools, and
        * whether the final response roughly matches the expected text.
 
-2. LoCoMo-style long-term memory benchmark (locomo1_converted.json):
+2. Evidence-fed LoCoMo QA benchmark (locomo1_converted.json):
    - JSON schema: {"test_cases": [...conversation sessions...], "qa": [...] }
    - test_cases contain conversations with "dia_id" fields.
    - qa contains questions with:
          { "question", "answer"?, "evidence": [dia_ids...], "category", "adversarial_answer"? }
    - For each QA item we build a short context from the referenced
      evidence turns, ask the question, and compare the model's answer.
+   - This is not the full memory benchmark; it bypasses memory storage and
+     retrieval by supplying gold evidence directly.
 
 The agent is accessed over HTTP using the FastAPI server from this repo.
 Make sure the server is running, e.g.:
@@ -343,21 +345,25 @@ def reset_short_term_session(
     userid: str,
     timeout: float,
     preserve_memory: bool = True,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Reset the short-term session for a user via the /reset endpoint.
-    
+
     Args:
         server_url: Base URL of the agent server
         userid: User identifier
         timeout: HTTP timeout in seconds
         preserve_memory: If True, keep long-term memories intact
-        
+        model: Model to use for preference extraction (if preserve_memory=True)
+
     Returns:
         Response from the server
     """
     url = f"{server_url.rstrip('/')}/reset/{userid}"
-    params = {"preserve_memory": preserve_memory}
+    params: Dict[str, Any] = {"preserve_memory": preserve_memory}
+    if model:
+        params["model"] = model
     resp = requests.post(url, params=params, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
@@ -961,7 +967,7 @@ def run_locomo_benchmark(
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Run JSON-defined benchmarks against the CSE291-A agent server."
+        description="Run tool-usage benchmarks or evidence-fed LoCoMo QA against the CSE291-A agent server."
     )
     parser.add_argument(
         "--dataset",

@@ -12,21 +12,18 @@ import json
 import ssl
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.request import urlopen
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.locomo_storage_utils import normalize_locomo_evidence
 
 OFFICIAL_LOCOMO_URL = (
     "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
-)
-PROJECT_BENCHMARKS = (
-    "short.json",
-    "medium.json",
-    "long.json",
-    "eval_results/short_results.json",
-    "eval_results/medium_results.json",
-    "eval_results/long_results.json",
-    "eval_results/locomo_memory_results.json",
 )
 
 
@@ -53,6 +50,20 @@ def iter_session_numbers(conversation: Dict[str, Any]) -> Iterable[int]:
         except (IndexError, ValueError):
             continue
     return sorted(seen)
+
+
+def parse_session_date(date_str: str) -> Optional[str]:
+    """Parse LoCoMo date string like '4:10 pm on 26 October, 2023' -> '2023-10-26'."""
+    import re
+    m = re.search(r"(\d+)\s+(\w+),\s+(\d{4})", date_str)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y"
+        ).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def convert_locomo_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -83,21 +94,41 @@ def convert_locomo_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
                     "speaker": speaker,
                     "content": turn.get("text", ""),
                     "dia_id": turn.get("dia_id"),
+                    "img_url": turn.get("img_url"),
+                    "blip_caption": turn.get("blip_caption"),
+                    "query": turn.get("query"),
+                    "re_download": turn.get("re-download"),
                 }
             )
+
+        raw_date = conversation.get(f"session_{session_num}_date_time", "")
+        session_date = parse_session_date(raw_date) if raw_date else None
 
         test_cases.append(
             {
                 "id": f"{sample_id}_session_{session_num}",
                 "type": "extra_session_context",
                 "expected_tools": [],
+                "session_date": session_date,
+                "session_datetime_raw": raw_date or None,
                 "conversation": converted_turns,
             }
         )
 
+    qa_items = []
+    for qa in sample.get("qa", []):
+        qa_copy = dict(qa)
+        raw_evidence = qa_copy.get("evidence") or []
+        normalized_evidence = normalize_locomo_evidence(raw_evidence)
+        qa_copy["evidence"] = normalized_evidence
+        if normalized_evidence != raw_evidence:
+            qa_copy["evidence_raw"] = raw_evidence
+        qa_items.append(qa_copy)
+
     return {
+        "sample_id": sample_id,
         "test_cases": test_cases,
-        "qa": sample.get("qa", []),
+        "qa": qa_items,
     }
 
 
@@ -127,21 +158,6 @@ def main(argv: List[str] | None = None) -> int:
         help="Directory to populate (default: ./benchmark)",
     )
     parser.add_argument(
-        "--repo-owner",
-        default="siriuxyu",
-        help="GitHub owner for repo-hosted benchmark JSON files",
-    )
-    parser.add_argument(
-        "--repo-name",
-        default="ReAct-Agent",
-        help="GitHub repo for repo-hosted benchmark JSON files",
-    )
-    parser.add_argument(
-        "--repo-ref",
-        default="main",
-        help="Git ref for repo-hosted benchmark JSON files",
-    )
-    parser.add_argument(
         "--locomo-sample-id",
         default="conv-26",
         help="Official LoCoMo sample_id to extract into locomo1.json",
@@ -149,10 +165,6 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     benchmark_dir = Path(args.benchmark_dir).resolve()
-    raw_base = (
-        f"https://raw.githubusercontent.com/"
-        f"{args.repo_owner}/{args.repo_name}/{args.repo_ref}/benchmark"
-    )
 
     print(f"Writing benchmark files into {benchmark_dir}")
 
@@ -165,11 +177,6 @@ def main(argv: List[str] | None = None) -> int:
     )
     print(f"Downloaded official LoCoMo sample {args.locomo_sample_id} -> locomo1.json")
     print("Generated locomo1_converted.json from the official sample")
-
-    for relative_path in PROJECT_BENCHMARKS:
-        payload = download_json(f"{raw_base}/{relative_path}")
-        write_json(benchmark_dir / relative_path, payload)
-        print(f"Downloaded {relative_path}")
 
     return 0
 
