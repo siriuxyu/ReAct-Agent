@@ -1,9 +1,13 @@
 """Generate benchmark performance charts for README."""
+from pathlib import Path
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ── Color palette ──────────────────────────────────────────────
 C_PHASE1  = '#9DB2C9'   # muted blue-grey  (baseline)
@@ -123,6 +127,7 @@ for i, (label, value, sub) in enumerate(metrics):
     ax4.text(0.04, y_pos-0.12, sub,   transform=ax4.transAxes,
              fontsize=8, color='#888', va='top')
 
-out_path = '/home/siriux/Projects/ReAct/docs/benchmark_performance.png'
+out_path = REPO_ROOT / 'docs' / 'benchmark_performance.png'
+out_path.parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=C_BG)
 print(f'Saved: {out_path}')

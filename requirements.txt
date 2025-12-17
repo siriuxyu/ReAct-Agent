@@ -1,56 +1,32 @@
-# Core LangChain dependencies
+# Core runtime dependencies
 langchain>=0.3.0
 langchain-core>=0.3.0
 langgraph>=0.2.0
 
-# LangMem for long-term memory management
+# Long-term memory
 langmem>=0.0.14
-langchain-openai>=0.3.0  # Required for embeddings
 
-# ChromaDB for persistent vector storage (used by storage/ module)
+# Vector storage and embeddings
 chromadb>=0.4.0
-openai>=1.0.0  # For OpenAI embeddings
+openai>=1.0.0
 
-# Optional: sentence-transformers for local embeddings
-# sentence-transformers>=2.2.0
-
-# Anthropic provider for Claude models
+# Claude model provider
 langchain-anthropic>=0.3.0
 anthropic>=0.40.0
 
-# For OpenAI models (uncomment if needed)
-# langchain-openai>=0.3.0
-# openai>=1.0.0
-
-# For other providers (uncomment as needed)
-# langchain-google-genai>=2.0.0  # For Google Gemini
-# google-generativeai>=0.8.0
-# langchain-cohere>=0.3.0  # For Cohere models
-# cohere>=4.0.0
-
-# Optional: Tavily search (commented out in tools.py but may be useful)
-# langchain-tavily>=0.1.0
-
-# Standard library dependencies (usually included with Python)
-# asyncio - built-in
-# dataclasses - built-in (Python 3.7+)
-# typing - built-in
-# typing_extensions - for Annotated type hints
+# Typing helpers
 typing_extensions>=4.0.0
 
-# Additional utilities that might be needed
-# os - built-in
-# datetime - built-in
-
-# FastAPI dependencies
+# API server
 fastapi>=0.104.0
 uvicorn>=0.24.0
-redis>=5.0.0
-langgraph-checkpoint-redis>=0.1.0
 pydantic>=2.0.0
 
-# Environment variable management
+# Env and HTTP
 python-dotenv>=1.0.0
-
-# HTTP client for benchmark runners
 requests>=2.31.0
+
+# Optional features
+# sentence-transformers>=2.2.0
+# redis>=5.0.0
+# langgraph-checkpoint-redis>=0.1.0
