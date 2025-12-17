@@ -30,10 +30,10 @@ To run this archived version (for comparison purposes):
 
 ```bash
 # From the project root
-python agent-phase1/run_agent.py
+python agent/phase1/run_agent.py
 
 # With debug mode
-python agent-phase1/run_agent.py --debug
+python agent/phase1/run_agent.py --debug
 ```
 
 **Note:** This archived version uses its own isolated agent modules but shares the `tools/` directory from the project root. 
