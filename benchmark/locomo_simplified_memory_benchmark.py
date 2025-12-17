@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-LoCoMo batch runner that minimizes LLM invocations.
+LoCoMo simplified memory benchmark runner.
 
 For each persona we:
 1) Send a single call that contains all of their conversation transcripts so the
@@ -9,6 +9,8 @@ For each persona we:
    for that persona, asking the agent to answer them in JSON.
 
 This keeps the number of Claude calls to two per persona instead of per turn.
+Use this script when you want a cheap approximation of the LoCoMo memory task,
+not the full store/retrieve benchmark.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
 from typing import Any, Dict, List, Tuple, Optional
 
 from benchmark_runner import (
@@ -27,6 +28,7 @@ from benchmark_runner import (
     call_agent,
     reset_short_term_session,
 )
+from locomo_storage_utils import build_persona_map
 
 # Token limits (approximate - 1 token ≈ 4 characters)
 # Claude rate limits: 30K input tokens/min for Sonnet/Opus, 50K for Haiku
@@ -65,6 +67,7 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 def build_transcript(
     conversations: List[List[Dict[str, Any]]],
+    session_dates: Optional[List[str]] = None,
     max_chars: int = DEFAULT_MAX_TRANSCRIPT_CHARS,
 ) -> str:
     """Build transcript with optional length limit."""
@@ -72,16 +75,28 @@ def build_transcript(
     total_chars = 0
     
     for idx, convo in enumerate(conversations, start=1):
-        lines = [f"[Session {idx}]"]
+        date_suffix = ""
+        if session_dates and idx <= len(session_dates) and session_dates[idx - 1]:
+            date_suffix = f" - {session_dates[idx - 1]}"
+        lines = [f"[Session {idx}{date_suffix}]"]
         session_chars = len(lines[0])
         
         for turn in convo or []:
             speaker = turn.get("speaker") or turn.get("role") or "unknown"
             content = turn.get("content", "")
+            blip_caption = turn.get("blip_caption")
             dia_id = turn.get("dia_id")
             prefix = f"[{dia_id}] " if dia_id else ""
             
-            line = f"{prefix}{speaker}: {content}"
+            line_parts = []
+            if content:
+                line_parts.append(f"{prefix}{speaker}: {content}")
+            if blip_caption:
+                line_parts.append(f"[image_caption] {blip_caption}")
+            if not line_parts:
+                continue
+
+            line = "\n".join(line_parts)
             line_chars = len(line) + 1  # +1 for newline
             
             # Check if adding this line would exceed limit
@@ -89,8 +104,8 @@ def build_transcript(
                 # Truncate remaining content
                 remaining_budget = max_chars - total_chars - session_chars - 50
                 if remaining_budget > 100:
-                    truncated_content = content[:remaining_budget] + "..."
-                    lines.append(f"{prefix}{speaker}: {truncated_content}")
+                    truncated_content = line[:remaining_budget] + "..."
+                    lines.append(truncated_content)
                 lines.append("[... remaining content truncated ...]")
                 break
             
@@ -232,6 +247,7 @@ def evaluate_answers(raw: str, qa_payload: List[Dict[str, Any]]) -> List[Dict[st
 def run_persona(
     persona: str,
     conversations: List[List[Dict[str, Any]]],
+    session_dates: Optional[List[str]],
     qa_items: List[Dict[str, Any]],
     *,
     userid_prefix: str,
@@ -248,7 +264,11 @@ def run_persona(
     userid = f"{userid_prefix}_{persona}"
     
     # Build transcript with length limit
-    transcript = build_transcript(conversations, max_chars=max_transcript_chars)
+    transcript = build_transcript(
+        conversations,
+        session_dates=session_dates,
+        max_chars=max_transcript_chars,
+    )
     transcript_tokens = estimate_tokens(transcript)
     print(f"  Transcript: {len(transcript)} chars (~{transcript_tokens} tokens)")
     
@@ -274,7 +294,7 @@ def run_persona(
         preload_response = f"Error: {e}"
 
     try:
-        reset_short_term_session(server_url, userid, timeout)
+        reset_short_term_session(server_url, userid, timeout, preserve_memory=True, model=model)
     except Exception as exc:
         print(f"  [WARN] Failed to reset session for {userid}: {exc}")
 
@@ -317,34 +337,10 @@ def run_persona(
         "qa_results": qa_results,
     }
 
-
-def build_persona_map(data: Dict[str, Any]) -> Tuple[Dict[str, List[List[Dict[str, Any]]]], Dict[str, List[Dict[str, Any]]]]:
-    personas_conversations: Dict[str, List[List[Dict[str, Any]]]] = defaultdict(list)
-    personas_qa: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    dia_persona: Dict[str, str] = {}
-
-    for tc in data.get("test_cases", []):
-        persona = (tc.get("id") or "persona_unknown").split("_session")[0]
-        personas_conversations[persona].append(tc.get("conversation") or [])
-        for turn in tc.get("conversation") or []:
-            dia_id = turn.get("dia_id")
-            if dia_id:
-                dia_persona[dia_id] = persona
-
-    for qa in data.get("qa", []):
-        persona = None
-        for ev in qa.get("evidence") or []:
-            persona = dia_persona.get(ev)
-            if persona:
-                break
-        if persona:
-            personas_qa[persona].append(qa)
-
-    return personas_conversations, personas_qa
-
-
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="LoCoMo batch runner (two calls per persona).")
+    parser = argparse.ArgumentParser(
+        description="LoCoMo simplified memory benchmark: preload transcript, reset, then ask QA in one batch."
+    )
     parser.add_argument(
         "--benchmark-dir",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark"),
@@ -387,7 +383,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     locomo_file = args.locomo_file or os.path.join(args.benchmark_dir, "locomo1_converted.json")
     data = load_json(locomo_file)
 
-    personas_convos, personas_qa = build_persona_map(data)
+    personas_convos, personas_session_dates, _personas_session_datetimes_raw, personas_qa = build_persona_map(data)
     personas = list(personas_convos.keys())
     if args.limit_personas is not None:
         personas = personas[: args.limit_personas]
@@ -405,6 +401,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         result = run_persona(
             persona,
             personas_convos[persona],
+            personas_session_dates.get(persona),
             qa_items,
             userid_prefix=args.userid_prefix,
             server_url=args.server_url,
@@ -429,7 +426,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "details": all_results,
     }
 
-    output_path = os.path.join(os.getcwd(), "locomo_batch_results.json")
+    output_path = os.path.join(os.getcwd(), "locomo_simplified_memory_results.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f"\nResults written to {output_path}")
@@ -437,4 +434,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
