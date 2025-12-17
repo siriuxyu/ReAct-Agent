@@ -70,13 +70,13 @@ For comparison and benchmarking purposes, you can also run archived agent versio
 
 ```bash
 # Run Phase 1 archived agent
-python agent-phase1/run_agent.py
+python agent/phase1/run_agent.py
 
 # With debug mode
-python agent-phase1/run_agent.py --debug
+python agent/phase1/run_agent.py --debug
 ```
 
-See [agent-phase1/README.md](agent-phase1/README.md) for more details about the archived version.
+See [agent/phase1/README.md](agent/phase1/README.md) for more details about the archived version.
 
 ### API Endpoints
 
@@ -258,7 +258,7 @@ CSE291-A/
 │       ├── __init__.py
 │       ├── vector_storage.py  # ChromaDB vector storage
 │       └── embedding_service.py # OpenAI embeddings
-├── agent-phase1/               # Phase 1 agent archive (for comparison)
+├── agent/phase1/               # Phase 1 agent archive
 │   ├── graph.py               # Archived agent graph
 │   ├── context.py             # Archived context
 │   ├── state.py               # Archived state
