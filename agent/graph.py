@@ -414,7 +414,7 @@ def route_model_output(state: State) -> Literal["__end__", "tools", "extract_pre
 builder.add_conditional_edges(
     "call_model",
     route_model_output,
-    {"tools": "tools", "extract_preferences": "extract_preferences"}
+    {"tools": "tools", "extract_preferences": "extract_preferences", "__end__": "__end__"}
 )
 
 # Add edge from tools back to call_model
