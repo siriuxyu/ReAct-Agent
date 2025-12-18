@@ -37,6 +37,9 @@ load_dotenv()
 _active_sessions: Dict[str, Dict[str, Any]] = {}
 _session_aliases: Dict[str, str] = {}
 _finalized_sessions: set[str] = set()
+# Cache injected preferences per userid: {userid: (fetched_at_timestamp, prefs_list)}
+_pref_cache: Dict[str, tuple] = {}
+PREF_CACHE_TTL = int(os.environ.get("PREF_CACHE_TTL", 300))  # 5 min
 
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", 1800))  # 30 min
 SESSION_SWEEP_INTERVAL  = int(os.environ.get("SESSION_SWEEP_INTERVAL",  300))   # 5 min
@@ -166,8 +169,8 @@ async def lifespan(app: FastAPI):
 
 
 api = FastAPI(
-    title="CSE291-A Agent API",
-    description="React Agent with LangMem long-term memory support",
+    title="ReAct Agent API",
+    description="ReAct Agent with long-term memory support",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -260,7 +263,7 @@ def _session_exists(session_id: str) -> bool:
 ########################################################
 # Session management
 ########################################################
-@api.post("/sessions", response_model=SessionResponse)
+@api.post("/sessions", response_model=SessionResponse, tags=["Agent"])
 async def create_session(req: SessionCreateRequest):
     """Create a new session or verify an existing one.
 
@@ -296,7 +299,7 @@ async def create_session(req: SessionCreateRequest):
 ########################################################
 # Invoke the React Agent with user context
 ########################################################
-@api.post("/invoke", response_model=ReactResponse)
+@api.post("/invoke", response_model=ReactResponse, tags=["Agent"])
 async def invoke(req: ReactRequest):
     """Invoke the React agent with the provided messages and context.
 
@@ -350,14 +353,17 @@ async def invoke(req: ReactRequest):
         base_prompt = req.system_prompt or "You are a helpful AI assistant."
         if is_new_session and is_langmem_enabled() and req.userid:
             try:
-                from agent.interfaces import StorageType
-                manager = get_langmem_manager()
-                prefs = await manager.search_user_memory(
-                    user_id=req.userid,
-                    query="user preferences",
-                    limit=10,
-                    document_type=StorageType.USER_PREFERENCE,
-                )
+                cached = _pref_cache.get(req.userid)
+                if cached and (time.time() - cached[0]) < PREF_CACHE_TTL:
+                    prefs = cached[1]
+                else:
+                    manager = get_langmem_manager()
+                    prefs = await manager.search_user_memories(
+                        user_id=req.userid,
+                        query="user preferences",
+                        limit=10,
+                    )
+                    _pref_cache[req.userid] = (time.time(), prefs)
                 if prefs:
                     pref_text = "\n".join(f"- {p['content']}" for p in prefs)
                     base_prompt += f"\n\n## Known user preferences\n{pref_text}"
@@ -618,7 +624,7 @@ async def invoke(req: ReactRequest):
 ########################################################
 # Simple chat endpoint (no context history)
 ########################################################
-@api.post("/chat")
+@api.post("/chat", tags=["Agent"])
 async def chat(req: ChatRequest):
     """Simple chat endpoint for single message interactions without context history."""
     request_id = uuid.uuid4().hex
@@ -804,7 +810,7 @@ async def chat(req: ChatRequest):
 ########################################################
 # Check state endpoint
 ########################################################
-@api.get("/state/session/{session_id}")
+@api.get("/state/session/{session_id}", tags=["Session"])
 async def check_session_state(session_id: str):
     """Check the conversation state for a specific session."""
     try:
@@ -825,7 +831,7 @@ async def check_session_state(session_id: str):
         return {"error": str(e)}
 
 
-@api.get("/state/{userid}")
+@api.get("/state/{userid}", tags=["Session"], deprecated=True)
 async def check_state(userid: str):
     """Legacy alias for session state, using userid as the session id."""
     return await check_session_state(userid)
@@ -834,11 +840,12 @@ async def check_state(userid: str):
 ########################################################
 # Reset short-term session (clear conversation history)
 ########################################################
-@api.post("/reset/session/{session_id}")
+@api.post("/reset/session/{session_id}", tags=["Session"])
 async def reset_short_term_session(
     session_id: str,
     userid: Optional[str] = None,
     preserve_memory: bool = True,
+    model: Optional[str] = None,
 ):
     """
     Reset the short-term conversation history for a session.
@@ -879,11 +886,15 @@ async def reset_short_term_session(
             and effective_session_id not in _finalized_sessions
         ):
             from agent.preference import force_extract_and_persist
-            prefs_extracted = await force_extract_and_persist(
-                messages=current_messages,
-                user_id=userid,
-                model="anthropic/claude-haiku-4-5-20251001",
-            )
+            _pref_model = model or "anthropic/claude-haiku-4-5-20251001"
+            try:
+                prefs_extracted = await force_extract_and_persist(
+                    messages=current_messages,
+                    user_id=userid,
+                    model=_pref_model,
+                )
+            except Exception as e:
+                logger.warning(f"force_extract_and_persist failed: {e}")
             _finalized_sessions.add(effective_session_id)
 
         # If not preserving memory, clear LangMem instead
@@ -926,20 +937,21 @@ async def reset_short_term_session(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@api.post("/reset/{userid}")
-async def reset_user_session(userid: str, preserve_memory: bool = True):
+@api.post("/reset/{userid}", tags=["Session"], deprecated=True)
+async def reset_user_session(userid: str, preserve_memory: bool = True, model: Optional[str] = None):
     """Legacy alias for resetting the userid-scoped default session."""
     return await reset_short_term_session(
         session_id=userid,
         userid=userid,
         preserve_memory=preserve_memory,
+        model=model,
     )
 
 
 ########################################################
 # Memory injection endpoint
 ########################################################
-@api.post("/memory/{userid}/inject", response_model=InjectResponse)
+@api.post("/memory/{userid}/inject", response_model=InjectResponse, tags=["Memory"])
 async def inject_memory(userid: str, req: InjectRequest):
     """
     Inject raw text into a user's long-term memory.
@@ -987,7 +999,7 @@ async def inject_memory(userid: str, req: InjectRequest):
     facts_extracted = 0
     if req.extract_facts and chunks_stored > 0:
         try:
-            from benchmark.locomo_memory_runner import extract_session_observations
+            from agent.extraction.fact_extraction import extract_session_observations
             facts_text = await extract_session_observations(content, req.model)
             if facts_text:
                 facts_content = f"{header}\n[Facts]\n{facts_text}".strip() if header else f"[Facts]\n{facts_text}"
@@ -1068,7 +1080,7 @@ def _split_into_chunks(text: str, chunk_size: int) -> List[str]:
 ########################################################
 # LangMem Memory Management Endpoints
 ########################################################
-@api.get("/memory/{userid}")
+@api.get("/memory/{userid}", tags=["Memory"])
 async def list_memories(userid: str, limit: int = 100):
     """
     List all memories for a specific user.
@@ -1090,7 +1102,7 @@ async def list_memories(userid: str, limit: int = 100):
     }
 
 
-@api.post("/memory/{userid}/search")
+@api.post("/memory/{userid}/search", tags=["Memory"])
 async def search_memories(userid: str, req: MemorySearchRequest):
     """
     Search memories for a specific user.
@@ -1117,7 +1129,7 @@ async def search_memories(userid: str, req: MemorySearchRequest):
     }
 
 
-@api.post("/memory/{userid}/store")
+@api.post("/memory/{userid}/store", tags=["Memory"])
 async def store_memory(userid: str, req: MemoryStoreRequest):
     """
     Store a memory for a specific user.
@@ -1154,7 +1166,7 @@ async def store_memory(userid: str, req: MemoryStoreRequest):
     }
 
 
-@api.delete("/memory/{userid}/{key}")
+@api.delete("/memory/{userid}/{key}", tags=["Memory"])
 async def delete_memory(userid: str, key: str):
     """
     Delete a specific memory for a user.
@@ -1179,7 +1191,7 @@ async def delete_memory(userid: str, key: str):
     }
 
 
-@api.delete("/memory/{userid}")
+@api.delete("/memory/{userid}", tags=["Memory"])
 async def clear_memories(userid: str):
     """
     Clear all memories for a specific user.
@@ -1206,7 +1218,7 @@ async def clear_memories(userid: str):
 ########################################################
 # Health check and status endpoints
 ########################################################
-@api.get("/health")
+@api.get("/health", tags=["System"])
 async def health_check():
     """Health check endpoint."""
     return {
@@ -1215,7 +1227,7 @@ async def health_check():
     }
 
 
-@api.get("/status")
+@api.get("/status", tags=["System"])
 async def status():
     """Get system status including LangMem and storage configuration."""
     manager = get_langmem_manager()
@@ -1248,7 +1260,7 @@ async def status():
     }
 
 
-@api.get("/storage/stats")
+@api.get("/storage/stats", tags=["System"])
 async def storage_stats(userid: Optional[str] = None):
     """
     Get storage statistics.
