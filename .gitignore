@@ -12,11 +12,12 @@ result/
 eval_locomo.py
 eval.py
 chroma_db_data/
-locomo_batch_results.json
-locomo_batch_results_copy.json
 benchmark/convert.py
-locomo_checkpoint_final_20251205_192835.json
+locomo_checkpoint.json
+locomo_checkpoint*.json
+locomo_*_results.json
+0412-*.txt
 
-# Benchmark datasets and checked-in eval artifacts are downloaded on demand.
+# Benchmark datasets are downloaded on demand; eval artifacts are local only.
 benchmark/*.json
-benchmark/eval_results/*.json
+benchmark/eval_results/
