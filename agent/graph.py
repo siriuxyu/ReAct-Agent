@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Literal, cast, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
+# LangSmith tracing — enabled automatically when LANGCHAIN_TRACING_V2=true.
+# No code changes needed; LangGraph hooks into LangChain's callback system.
+# Set the following env vars to activate:
+#   LANGCHAIN_TRACING_V2=true
+#   LANGCHAIN_API_KEY=<your-key>
+#   LANGCHAIN_PROJECT=react-agent
+_tracing_enabled = os.environ.get("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1")
+
 # Python version compatibility for UTC
 if sys.version_info >= (3, 11):
     from datetime import UTC
@@ -59,6 +67,11 @@ redis = None
 
 # Initialize logger
 logger = get_logger(__name__)
+logger.info(
+    "LangSmith tracing %s",
+    f"enabled (project={os.environ.get('LANGCHAIN_PROJECT', 'default')})"
+    if _tracing_enabled else "disabled (set LANGCHAIN_TRACING_V2=true to enable)",
+)
 
 
 def get_tools_with_memory(user_id: Optional[str] = None) -> List:
