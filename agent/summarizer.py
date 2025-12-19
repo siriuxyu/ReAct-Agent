@@ -6,7 +6,7 @@ summarized into a single SystemMessage to keep the context window manageable
 while preserving key user facts across extended interactions.
 """
 
-from typing import List, Tuple
+from typing import Any, List, Tuple, Union
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
@@ -15,6 +15,25 @@ from agent.utils import get_logger, load_chat_model
 logger = get_logger(__name__)
 
 COMPRESSION_THRESHOLD = 14  # compress when len(messages) > this
+
+
+def _extract_text(content: Union[str, List[Any]]) -> str:
+    """Extract plain text from a message content that may be str or a multimodal list."""
+    if isinstance(content, str):
+        return content
+    parts: List[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "image":
+                parts.append("[image]")
+            elif btype == "document":
+                parts.append("[document]")
+    return " ".join(parts)
 KEEP_RECENT = 6             # always keep this many recent messages verbatim
 
 _SUMMARIZE_PROMPT = """Summarize the conversation below into a compact context note.
@@ -59,9 +78,9 @@ async def compress_messages(
     lines = []
     for m in old_msgs:
         if isinstance(m, HumanMessage):
-            lines.append(f"User: {m.content}")
+            lines.append(f"User: {_extract_text(m.content)}")
         elif isinstance(m, AIMessage) and m.content:
-            lines.append(f"Assistant: {m.content}")
+            lines.append(f"Assistant: {_extract_text(m.content)}")
 
     conversation_text = "\n".join(lines)
     prompt = _SUMMARIZE_PROMPT.format(conversation=conversation_text)

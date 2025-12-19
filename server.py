@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import asyncio
 import os
 import uuid
@@ -177,11 +177,48 @@ api = FastAPI(
 
 
 ########################################################
+# Helpers
+########################################################
+def _content_preview(content: Union[str, List[Any]], max_chars: int = 100) -> str:
+    """Return a short text preview of a message content (str or multimodal list)."""
+    if isinstance(content, str):
+        return content[:max_chars]
+    # Multimodal list: collect text blocks, note non-text blocks
+    parts: List[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block[:max_chars])
+        elif isinstance(block, dict):
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", "")[:max_chars])
+            elif btype == "image":
+                src = block.get("source", {})
+                media = src.get("media_type", "image")
+                parts.append(f"[{media}]")
+            elif btype == "document":
+                src = block.get("source", {})
+                media = src.get("media_type", "application/pdf")
+                parts.append(f"[{media}]")
+            else:
+                parts.append(f"[{btype}]")
+    preview = " ".join(parts)
+    return preview[:max_chars]
+
+
+########################################################
 # Define the request body format
 ########################################################
+# ContentBlock mirrors the Anthropic multimodal content-block schema.
+# For images:   {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "<b64>"}}
+# For PDFs:     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "<b64>"}}
+# For text:     {"type": "text", "text": "..."}
+ContentBlock = Dict[str, Any]
+
 class Message(BaseModel):
     role: str
-    content: str
+    # content can be plain text OR a multimodal list of content blocks
+    content: Union[str, List[ContentBlock]]
 
 class ReactRequest(BaseModel):
     messages: List[Message]
@@ -319,7 +356,7 @@ async def invoke(req: ReactRequest):
                 'model': req.model or "default",
                 'has_system_prompt': req.system_prompt is not None,
                 'langmem_enabled': is_langmem_enabled(),
-                'first_message_preview': req.messages[0].content[:100] if req.messages else None
+                'first_message_preview': _content_preview(req.messages[0].content) if req.messages else None
             }
         })
         
@@ -329,7 +366,7 @@ async def invoke(req: ReactRequest):
         logger.debug("Processing messages", extra={
             'request_id': request_id,
             'user_id': req.userid,
-            'details': {'messages': [{'role': m['role'], 'content': m['content'][:100]} for m in messages]}
+            'details': {'messages': [{'role': m['role'], 'content': _content_preview(m['content'])} for m in messages]}
         })
         
         # session_id scopes the short-term message history (LangGraph checkpoint).
