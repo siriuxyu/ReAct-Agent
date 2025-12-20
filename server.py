@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Union
+from typing import AsyncIterator, List, Dict, Any, Optional, Union
 import asyncio
+import json
 import os
 import uuid
 import time
@@ -392,6 +394,92 @@ async def _prepare_agent_run(req: ReactRequest):
     context = Context(**context_kwargs)
 
     return config, context, messages, effective_session_id
+
+
+def _extract_text_from_chunk(chunk: Dict) -> Optional[str]:
+    """Pull the assistant text out of a LangGraph astream chunk, if any."""
+    for node_output in chunk.values():
+        msgs = node_output.get("messages", []) if isinstance(node_output, dict) else []
+        for msg in msgs:
+            if not isinstance(msg, AIMessage):
+                continue
+            if getattr(msg, "tool_calls", None):
+                continue
+            content = msg.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                text = "".join(parts)
+                if text:
+                    return text
+    return None
+
+
+async def _sse_generator(
+    req: ReactRequest, request_id: str
+) -> AsyncIterator[str]:
+    """
+    Yield SSE-formatted events:
+      data: {"type": "session",  "session_id": "..."}
+      data: {"type": "chunk",    "content": "..."}
+      data: {"type": "done",     "final_response": "..."}
+      data: {"type": "error",    "message": "..."}
+    """
+    def event(payload: Dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    try:
+        config, context, messages, session_id = await _prepare_agent_run(req)
+        yield event({"type": "session", "session_id": session_id})
+
+        final_response = ""
+        async for chunk in graph.astream({"messages": messages}, config=config, context=context):
+            text = _extract_text_from_chunk(chunk)
+            if text:
+                final_response = text
+                yield event({"type": "chunk", "content": text})
+
+        _touch_session(effective_session_id, req.userid)
+        yield event({"type": "done", "final_response": final_response})
+
+    except Exception as e:
+        logger.error(f"SSE error [{request_id}]: {e}", exc_info=True)
+        yield event({"type": "error", "message": str(e)})
+
+
+########################################################
+# Stream endpoint (SSE)
+########################################################
+@api.post("/stream")
+async def stream(req: ReactRequest):
+    """
+    Stream agent responses as Server-Sent Events.
+
+    Event types:
+      session  — first event, carries session_id (save this for resume)
+      chunk    — incremental assistant text
+      done     — final complete response
+      error    — something went wrong
+
+    Example (curl):
+      curl -X POST http://localhost:8000/stream \\
+           -H 'Content-Type: application/json' \\
+           -d '{"userid":"alice","messages":[{"role":"user","content":"hi"}]}'
+    """
+    request_id = uuid.uuid4().hex
+    return StreamingResponse(
+        _sse_generator(req, request_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
 
 
 ########################################################
