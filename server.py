@@ -334,6 +334,67 @@ async def create_session(req: SessionCreateRequest):
 
 
 ########################################################
+# Shared helpers for invoke & stream
+########################################################
+async def _prepare_agent_run(req: ReactRequest):
+    """
+    Resolve session, inject preferences, build Context.
+    Returns (config, context, messages, effective_session_id).
+    """
+    session_id = req.session_id or req.userid
+    if not _is_session_owned_by_user(req.userid, session_id):
+        raise HTTPException(status_code=400, detail="session_id must match userid namespace")
+
+    effective_session_id = _resolve_session_id(session_id)
+    config = _session_config(effective_session_id)
+    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+
+    existing_state = _get_session_state(effective_session_id)
+    is_new_session = not _has_session_messages(existing_state)
+
+    base_prompt = req.system_prompt or "You are a helpful AI assistant."
+    if is_new_session and is_langmem_enabled() and req.userid:
+        try:
+            from agent.interfaces import StorageType
+            manager = get_langmem_manager()
+            prefs = await manager.search_user_memory(
+                user_id=req.userid,
+                query="user preferences",
+                limit=10,
+                document_type=StorageType.USER_PREFERENCE,
+            )
+            if prefs:
+                pref_text = "\n".join(f"- {p['content']}" for p in prefs)
+                base_prompt += f"\n\n## Known user preferences\n{pref_text}"
+        except Exception as _e:
+            logger.warning(f"Failed to inject preferences: {_e}")
+
+    if req.enable_preference_extraction is not None:
+        run_extraction = req.enable_preference_extraction
+    else:
+        existing_msgs = (
+            existing_state.values.get("messages", [])
+            if existing_state and existing_state.values else []
+        )
+        from langchain_core.messages import HumanMessage as _HM
+        human_turns = sum(1 for m in existing_msgs if isinstance(m, _HM))
+        run_extraction = ((human_turns + 1) % 10 == 0)
+
+    context_kwargs = dict(
+        system_prompt=base_prompt,
+        model=req.model or "anthropic/claude-sonnet-4-5-20250929",
+        max_search_results=req.max_search_results or 10,
+        user_id=req.userid,
+        enable_preference_extraction=run_extraction,
+    )
+    if req.enable_web_search is not None:
+        context_kwargs["enable_web_search"] = req.enable_web_search
+    context = Context(**context_kwargs)
+
+    return config, context, messages, effective_session_id
+
+
+########################################################
 # Invoke the React Agent with user context
 ########################################################
 @api.post("/invoke", response_model=ReactResponse, tags=["Agent"])
@@ -354,109 +415,21 @@ async def invoke(req: ReactRequest):
             'details': {
                 'message_count': len(req.messages),
                 'model': req.model or "default",
-                'has_system_prompt': req.system_prompt is not None,
                 'langmem_enabled': is_langmem_enabled(),
-                'first_message_preview': _content_preview(req.messages[0].content) if req.messages else None
             }
         })
-        
-        # Convert messages to the format expected by the graph
-        messages = [{"role": msg.role, "content": msg.content} for msg in req.messages]
-        
-        logger.debug("Processing messages", extra={
-            'request_id': request_id,
-            'user_id': req.userid,
-            'details': {'messages': [{'role': m['role'], 'content': _content_preview(m['content'])} for m in messages]}
-        })
-        
-        # session_id scopes the short-term message history (LangGraph checkpoint).
-        # userid scopes long-term memory (ChromaDB) and never changes.
-        # Older clients may omit session_id; in that case, reuse userid as the
-        # single session key to preserve the legacy behavior.
-        session_id = req.session_id or req.userid
-        if not _is_session_owned_by_user(req.userid, session_id):
-            raise HTTPException(
-                status_code=400,
-                detail="session_id must match userid namespace",
-            )
-        effective_session_id = _resolve_session_id(session_id)
-        config = _session_config(effective_session_id)
 
-        # Check if this is a new session (no prior messages for this session_id)
-        existing_state = _get_session_state(effective_session_id)
-        is_new_session = not _has_session_messages(existing_state)
+        config, context, messages, effective_session_id = await _prepare_agent_run(req)
 
-        # Build system prompt, injecting known preferences for new sessions
-        base_prompt = req.system_prompt or "You are a helpful AI assistant."
-        if is_new_session and is_langmem_enabled() and req.userid:
-            try:
-                cached = _pref_cache.get(req.userid)
-                if cached and (time.time() - cached[0]) < PREF_CACHE_TTL:
-                    prefs = cached[1]
-                else:
-                    manager = get_langmem_manager()
-                    prefs = await manager.search_user_memories(
-                        user_id=req.userid,
-                        query="user preferences",
-                        limit=10,
-                    )
-                    _pref_cache[req.userid] = (time.time(), prefs)
-                if prefs:
-                    pref_text = "\n".join(f"- {p['content']}" for p in prefs)
-                    base_prompt += f"\n\n## Known user preferences\n{pref_text}"
-                    logger.info(
-                        f"Injected {len(prefs)} preferences into system prompt for new session",
-                        extra={"request_id": request_id, "user_id": req.userid},
-                    )
-            except Exception as _e:
-                logger.warning(f"Failed to inject preferences: {_e}")
-
-        # Decide whether to run preference extraction this turn.
-        # Client override takes precedence; otherwise extract every 10 human turns.
-        if req.enable_preference_extraction is not None:
-            run_extraction = req.enable_preference_extraction
-        else:
-            existing_msgs = (
-                existing_state.values.get("messages", [])
-                if existing_state and existing_state.values else []
-            )
-            from langchain_core.messages import HumanMessage as _HumanMessage
-            human_turns = sum(1 for m in existing_msgs if isinstance(m, _HumanMessage))
-            # This request adds turn N+1; extract when (N+1) is a multiple of 10
-            run_extraction = ((human_turns + 1) % 10 == 0)
-
-        # Create context with optional parameters
-        context_kwargs = dict(
-            system_prompt=base_prompt,
-            model=req.model or "anthropic/claude-sonnet-4-5-20250929",
-            max_search_results=req.max_search_results or 10,
-            user_id=req.userid,
-            enable_preference_extraction=run_extraction,
-        )
-        if req.enable_web_search is not None:
-            context_kwargs["enable_web_search"] = req.enable_web_search
-        context = Context(**context_kwargs)
-
-        logger.debug("Context created", extra={
-            'request_id': request_id,
-            'user_id': req.userid,
-            'session_id': session_id,
-            'effective_session_id': effective_session_id,
-            'is_new_session': is_new_session,
-            'details': {
-                'system_prompt': context.system_prompt[:200],
-                'model': context.model,
-            }
-        })
-        
         # Stream the response from the graph
         response_messages = []
         final_response = ""
         chunk_count = 0
-        
+
         logger.info("Starting agent execution", extra={
             'request_id': request_id,
             'user_id': req.userid,
+            'session_id': effective_session_id,
             'function': 'graph.astream'
         })
         
