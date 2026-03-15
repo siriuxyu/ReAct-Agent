@@ -23,6 +23,12 @@ docs/
 # Reports and benchmark results
 Report/
 benchmark/eval_results/
+benchmark/locomo*.json
+locomo_checkpoint_*.json
+
+# Logs and large data files
+logs/
+*.png
 
 # Editor files
 .vscode/
