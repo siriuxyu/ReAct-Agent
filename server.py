@@ -366,8 +366,14 @@ async def _prepare_agent_run(req: ReactRequest):
                 document_type=StorageType.USER_PREFERENCE,
             )
             if prefs:
-                pref_text = "\n".join(f"- {p['content']}" for p in prefs)
-                base_prompt += f"\n\n## Known user preferences\n{pref_text}"
+                lines = []
+                for p in prefs:
+                    date_str = p.get("created_at", "")[:10]  # YYYY-MM-DD
+                    date_prefix = f"[{date_str}] " if date_str else ""
+                    ptype = p.get("metadata", {}).get("preference_type", "")
+                    type_prefix = f"[{ptype}] " if ptype else ""
+                    lines.append(f"- {date_prefix}{type_prefix}{p['content']}")
+                base_prompt += "\n\n## Known user preferences\n" + "\n".join(lines)
         except Exception as _e:
             logger.warning(f"Failed to inject preferences: {_e}")
 
