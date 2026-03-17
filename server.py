@@ -434,8 +434,8 @@ async def _sse_generator(
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     try:
-        config, context, messages, session_id = await _prepare_agent_run(req)
-        yield event({"type": "session", "session_id": session_id})
+        config, context, messages, effective_session_id = await _prepare_agent_run(req)
+        yield event({"type": "session", "session_id": effective_session_id})
 
         final_response = ""
         async for chunk in graph.astream({"messages": messages}, config=config, context=context):
