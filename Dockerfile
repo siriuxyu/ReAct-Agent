@@ -1,8 +1,17 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
-COPY . /app
 
-RUN pip install -r requirements.txt
+# Install deps first (layer cache)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Run as non-root
+RUN useradd -m appuser && chown -R appuser /app
+USER appuser
+
+EXPOSE 8000
 
 CMD ["python", "server.py"]

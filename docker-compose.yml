@@ -1,0 +1,49 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  agent:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/app/chroma_db_data
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      REDIS_URL: redis://redis:6379
+      CHROMA_PERSIST_PATH: /app/chroma_db_data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  bot:
+    build: .
+    restart: unless-stopped
+    command: python telegram_bot.py
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      AGENT_BASE_URL: http://agent:8000
+    depends_on:
+      agent:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  chroma_data:
