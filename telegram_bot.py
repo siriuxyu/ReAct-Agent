@@ -150,8 +150,12 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return
             lines = [f"找到 {len(results)} 条记忆：\n"]
             for i, item in enumerate(results, 1):
+                date_str = (item.get("created_at") or "")[:10]
+                date_prefix = f"[{date_str}] " if date_str else ""
+                ptype = item.get("metadata", {}).get("preference_type", "")
+                type_prefix = f"[{ptype}] " if ptype else ""
                 snippet = (item.get("content") or "")[:200].replace("\n", " ")
-                lines.append(f"{i}. {snippet}")
+                lines.append(f"{i}. {date_prefix}{type_prefix}{snippet}")
             await update.message.reply_text("\n".join(lines))
         except Exception as e:
             logger.error("Memory search failed for %s: %s", userid, e)
