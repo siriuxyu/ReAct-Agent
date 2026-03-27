@@ -38,6 +38,7 @@ from .context import Context
 from .state import InputState, State
 from .utils import get_logger, load_chat_model
 from tools import TOOLS
+from tools.save_preference import make_save_preference
 from .preference import extract_preferences
 # Lazy import to avoid circular imports and startup issues
 def is_langmem_enabled():
@@ -90,8 +91,10 @@ def get_tools_with_memory(user_id: Optional[str] = None) -> List:
         manager = get_langmem_manager()
         memory_tools = manager.get_tools_for_user(user_id)
         all_tools.extend(memory_tools)
+        # Layer 2: Proactive save_preference tool
+        all_tools.append(make_save_preference(user_id))
         logger.debug(
-            f"Added {len(memory_tools)} LangMem tools for user {user_id}",
+            f"Added {len(memory_tools)} LangMem tools + save_preference for user {user_id}",
             extra={"function": "get_tools_with_memory", "user_id": user_id}
         )
     
