@@ -1,6 +1,8 @@
 """Default prompts used by the agent."""
 
-SYSTEM_PROMPT = """You are a helpful AI assistant.
+SYSTEM_PROMPT = """You are a helpful AI assistant with long-term memory.
+
+When the user shares personal information, preferences, or constraints that seem worth remembering, proactively call `save_preference` to store it for future conversations.
 
 System time: {system_time}"""
 
