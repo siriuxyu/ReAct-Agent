@@ -1,4 +1,4 @@
-"""Telegram Bot front-end for the ReAct Agent server.
+"""Telegram Bot front-end for the Cliriux server.
 
 Each Telegram chat_id is mapped to a unique userid so memory is isolated
 per user. Supports text, photos, and PDF documents via the agent's

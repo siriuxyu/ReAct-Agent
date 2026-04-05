@@ -1,8 +1,13 @@
 .DS_Store
 __pycache__/
+*.py[cod]
+.pytest_cache/
 .env
+.env.local
 .claude/
 .idea/
+.tmp/
+.vscode/
 
 # Log files
 logs/
@@ -13,11 +18,11 @@ eval_locomo.py
 eval.py
 chroma_db_data/
 benchmark/convert.py
-locomo_checkpoint.json
-locomo_checkpoint*.json
-locomo_*_results.json
-0412-*.txt
 
 # Benchmark datasets are downloaded on demand; eval artifacts are local only.
 benchmark/*.json
 benchmark/eval_results/
+.worktrees/
+auth/token.json
+credentials.json
+scheduler.db

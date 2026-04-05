@@ -1,0 +1,19 @@
+[Unit]
+Description=Cliriux Agent API Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=siriux
+WorkingDirectory=/home/siriux/Projects/Cliriux
+EnvironmentFile=/home/siriux/Projects/Cliriux/.env
+ExecStart=/home/siriux/anaconda3/envs/agent/bin/python server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cliriux-agent
+
+[Install]
+WantedBy=multi-user.target

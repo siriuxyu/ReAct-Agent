@@ -1,0 +1,19 @@
+[Unit]
+Description=Cliriux Telegram Bot
+After=network.target cliriux-agent.service
+Requires=cliriux-agent.service
+
+[Service]
+Type=simple
+User=siriux
+WorkingDirectory=/home/siriux/Projects/Cliriux
+EnvironmentFile=/home/siriux/Projects/Cliriux/.env
+ExecStart=/home/siriux/anaconda3/envs/agent/bin/python telegram_bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cliriux-telegram
+
+[Install]
+WantedBy=multi-user.target
