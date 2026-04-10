@@ -48,11 +48,11 @@ def make_save_preference(user_id: str):
           - "Don't use markdown" → save_preference("User dislikes markdown formatting", "constraint")
         """
         try:
-            from agent.memory.memory_manager import get_langmem_manager
+            from agent.memory.memory_manager import get_memory_manager
             from agent.interfaces import StorageType
             import uuid
 
-            manager = get_langmem_manager()
+            manager = get_memory_manager()
             key = f"pref_tool_{uuid.uuid4().hex[:8]}"
 
             # Use _run_async helper to bridge sync tool -> async storage
