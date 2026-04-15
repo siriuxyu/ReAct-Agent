@@ -198,7 +198,13 @@ async def compress_messages(
     )
 
     try:
-        llm = load_chat_model(SUMMARY_MODEL)
+        from agent.model_router import select_model_for_step
+        summary_model = select_model_for_step(
+            SUMMARY_MODEL,
+            task_type="chat",
+            step_name="summarizer",
+        )
+        llm = load_chat_model(summary_model)
         response = await llm.ainvoke([HumanMessage(content=prompt)])
         summary_text = (response.content or "").strip()
         if not summary_text:
@@ -217,8 +223,13 @@ async def compress_messages(
     for i in range(compress_start):
         compressed.append(messages[i])
 
-    # Summary inserted as HumanMessage (agent sees it as context review)
-    compressed.append(HumanMessage(content=summary_text))
+    # Summary inserted as a generated SystemMessage so downstream extractors can ignore it.
+    compressed.append(
+        SystemMessage(
+            content=summary_text,
+            additional_kwargs={"summary_generated": True},
+        )
+    )
 
     # Tail: turns after compression region
     for i in range(actual_compress_end, len(messages)):
@@ -238,7 +249,7 @@ async def compress_messages(
                 "original_tokens": total_tokens,
                 "compressed_tokens": compressed_tokens,
                 "tokens_saved": tokens_saved,
-                "summary_model": SUMMARY_MODEL,
+                "summary_model": summary_model,
             },
         },
     )

@@ -63,7 +63,7 @@ class Context:
         default="",
         metadata={
             "description": "The user identifier for memory operations. "
-            "Used to namespace LangMem tools for user-specific memory."
+            "Used to namespace memory tools for user-specific memory."
         },
     )
 

@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, AIMessage, ToolMessage, BaseM
 from langgraph.runtime import Runtime
 
 from agent.context import Context
+from agent.model_router import select_model_for_step
 from agent.state import State
 from agent.utils import load_chat_model, get_logger
 from agent.schemas import UserProfileUpdate
@@ -64,9 +65,9 @@ async def _persist_raw_preference(
 ) -> bool:
     """Persist a raw preference dict (from regex or tool call) to ChromaDB."""
     try:
-        from agent.memory.memory_manager import get_langmem_manager
+        from agent.memory.memory_manager import get_memory_manager
         from agent.interfaces import StorageType
-        manager = get_langmem_manager()
+        manager = get_memory_manager()
         key = f"pref_{source}_{uuid.uuid4().hex[:8]}"
         content = pref["content"]
         await manager.store_user_memory(
@@ -97,6 +98,8 @@ def filter_messages_for_extraction(messages: List[BaseMessage]) -> List[BaseMess
     """
     filtered = []
     for msg in messages:
+        if getattr(msg, "additional_kwargs", {}).get("summary_generated"):
+            continue
         if isinstance(msg, ToolMessage):
             continue
         if isinstance(msg, AIMessage):
@@ -128,6 +131,8 @@ async def extract_preferences(
     recent_messages = state.messages[-3:]  # Only check last 3 for speed
     for msg in recent_messages:
         if isinstance(msg, BaseMessage) and getattr(msg, 'type', None) == 'human':
+            if getattr(msg, "additional_kwargs", {}).get("summary_generated"):
+                continue
             text = str(msg.content)
             hits = _try_regex_extract(text)
             for hit in hits:
@@ -142,7 +147,14 @@ async def extract_preferences(
     # --- Layer 3: LLM fallback for complex / implicit preferences ---
     # Skip if regex already found something and we want to save tokens
     # But always run if enable_preference_extraction is True (for thoroughness)
-    model = load_chat_model(runtime.context.model)
+    model_spec = select_model_for_step(
+        runtime.context.model,
+        task_type=state.task_type,
+        step_name="preference_extraction",
+        latest_user_text="",
+        has_tool_results=bool(state.tool_artifacts),
+    )
+    model = load_chat_model(model_spec)
     structured_llm = model.with_structured_output(UserProfileUpdate)
 
     recent_messages = state.messages[-10:]
@@ -205,6 +217,8 @@ async def force_extract_and_persist(
     regex_count = 0
     for msg in messages:
         if isinstance(msg, BaseMessage) and getattr(msg, 'type', None) == 'human':
+            if getattr(msg, "additional_kwargs", {}).get("summary_generated"):
+                continue
             text = str(msg.content)
             for hit in _try_regex_extract(text):
                 if await _persist_raw_preference(hit, user_id, source="regex"):
@@ -236,9 +250,9 @@ async def force_extract_and_persist(
 async def _persist_llm_preferences(preferences, user_id: str) -> None:
     """Persist LLM-extracted preferences to ChromaDB as USER_PREFERENCE documents."""
     try:
-        from agent.memory.memory_manager import get_langmem_manager
+        from agent.memory.memory_manager import get_memory_manager
         from agent.interfaces import StorageType
-        manager = get_langmem_manager()
+        manager = get_memory_manager()
         for pref in preferences:
             content = pref.content
             key = f"pref_{uuid.uuid4().hex[:12]}"

@@ -1,9 +1,9 @@
 """
-LangMem integration for long-term memory management.
+Long-term memory management with user-specific namespaces.
 
 This module provides:
 1. Memory store management with user_id-based namespaces
-2. Memory tools (manage/search) that agents can use
+2. Memory tools (search/store) that agents can use
 3. Integration with existing VectorStorageBackend (ChromaDB)
 
 The key feature is that memories are stored per-user, allowing:
@@ -31,23 +31,10 @@ from agent.utils import get_logger
 from agent.interfaces import StorageDocument, StorageType, SearchResult
 
 if TYPE_CHECKING:
-    from .memory_manager import LangMemManager
+    from .memory_manager import MemoryManager
 
 logger = get_logger(__name__)
 
-# Try importing langmem components for tools
-try:
-    from langgraph.store.memory import InMemoryStore
-    from langmem import create_manage_memory_tool, create_search_memory_tool
-
-    _LANGMEM_AVAILABLE = True
-except ImportError:
-    InMemoryStore = None  # type: ignore[assignment]
-    create_manage_memory_tool = create_search_memory_tool = None  # type: ignore[assignment]
-    _LANGMEM_AVAILABLE = False
-    logger.warning(
-        "LangMem not installed. Run `pip install langmem langchain-openai` to enable memory tools."
-    )
 
 # Import existing storage backend
 try:
@@ -68,9 +55,9 @@ def _bool_from_env(name: str, default: str = "1") -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-def is_langmem_enabled() -> bool:
-    """Return True when the LangMem dependency is installed and not disabled via env."""
-    return _LANGMEM_AVAILABLE and _bool_from_env("LANGMEM_ENABLED", "1")
+def is_memory_enabled() -> bool:
+    """Return True when persistent memory storage is available and not disabled via env."""
+    return _STORAGE_AVAILABLE and _bool_from_env("MEMORY_ENABLED", "1")
 
 
 def is_storage_available() -> bool:
@@ -105,7 +92,7 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
-def create_chromadb_memory_tools(user_id: str, manager: "LangMemManager") -> List:
+def create_chromadb_memory_tools(user_id: str, manager: "MemoryManager") -> List:
     """
     Create memory tools that use ChromaDB for persistent storage.
     
@@ -114,7 +101,7 @@ def create_chromadb_memory_tools(user_id: str, manager: "LangMemManager") -> Lis
     
     Args:
         user_id: The user identifier for memory namespace
-        manager: The LangMemManager instance
+        manager: The MemoryManager instance
         
     Returns:
         List of tools [search_memory, store_memory]
@@ -189,18 +176,18 @@ def create_chromadb_memory_tools(user_id: str, manager: "LangMemManager") -> Lis
     return [search_memory]  # store_memory removed: preferences are persisted automatically
 
 
-class LangMemManager:
+class MemoryManager:
     """
-    Manages LangMem store and tools for user-specific memory namespaces.
-    
+    Manages persistent memory store and tools for user-specific memory namespaces.
+
     This class provides:
-    - A single shared store instance (using VectorStorageBackend/ChromaDB)
+    - A single shared ChromaDB store instance (VectorStorageBackend)
     - User-specific memory tools with dynamic namespaces
     - Methods to search/manage memories for specific users
     """
-    
-    _instance: Optional["LangMemManager"] = None
-    
+
+    _instance: Optional["MemoryManager"] = None
+
     def __new__(cls):
         """Singleton pattern to ensure one store instance."""
         if cls._instance is None:
@@ -209,53 +196,19 @@ class LangMemManager:
         return cls._instance
     
     def __init__(self):
-        """Initialize the LangMem manager with storage backends."""
+        """Initialize the memory manager with storage backends."""
         if self._initialized:
             return
             
-        self._langmem_store = None  # For LangMem tools
         self._vector_storage = None  # For ChromaDB persistence
         self._user_tools_cache: Dict[str, List] = {}
         self._storage_initialized = False
-        
-        # Initialize stores
-        if is_langmem_enabled():
-            self._initialize_langmem_store()
-        
+
+        # Initialize vector storage
         if is_storage_available():
             self._initialize_vector_storage()
         
         self._initialized = True
-    
-    def _initialize_langmem_store(self):
-        """Initialize the LangMem InMemoryStore for tools."""
-        if InMemoryStore is None:
-            logger.warning("LangMem InMemoryStore unavailable")
-            return
-
-        dims = int(os.environ.get("LANGMEM_EMBED_DIM", "1536"))
-        embed_model = os.environ.get(
-            "LANGMEM_EMBED_MODEL",
-            "openai:text-embedding-3-small",
-        )
-
-        try:
-            self._langmem_store = InMemoryStore(
-                index={
-                    "dims": dims,
-                    "embed": embed_model,
-                }
-            )
-            logger.info(
-                "LangMem InMemoryStore initialized",
-                extra={
-                    "function": "LangMemManager._initialize_langmem_store",
-                    "details": {"dims": dims, "embed": embed_model},
-                },
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize LangMem store: {e}")
-            self._langmem_store = None
     
     def _initialize_vector_storage(self):
         """Initialize VectorStorageBackend for persistent storage."""
@@ -272,7 +225,7 @@ class LangMemManager:
                 return
             
             self._vector_storage = VectorStorageBackend(
-                collection_name="langmem_memories",
+                collection_name="agent_memories",
                 persist_path=persist_path,
                 embedding_provider="openai",
                 openai_api_key=openai_api_key,
@@ -282,7 +235,7 @@ class LangMemManager:
             logger.info(
                 "VectorStorageBackend configured (will initialize on first use)",
                 extra={
-                    "function": "LangMemManager._initialize_vector_storage",
+                    "function": "MemoryManager._initialize_vector_storage",
                     "details": {"persist_path": persist_path},
                 },
             )
@@ -306,19 +259,14 @@ class LangMemManager:
             await self._async_init_storage()
     
     @property
-    def langmem_store(self):
-        """Get the LangMem store instance (for graph compilation)."""
-        return self._langmem_store
-    
-    @property
     def vector_storage(self):
         """Get the VectorStorageBackend instance."""
         return self._vector_storage
-    
+
     @property
     def is_available(self) -> bool:
-        """Check if any memory backend is available."""
-        return self._langmem_store is not None or self._vector_storage is not None
+        """Check if persistent memory storage is available."""
+        return self._vector_storage is not None
     
     @property
     def has_persistent_storage(self) -> bool:
@@ -342,8 +290,7 @@ class LangMemManager:
         """
         Get memory tools configured for a specific user.
         
-        These tools use ChromaDB (VectorStorageBackend) for persistent storage,
-        NOT LangMem's InMemoryStore.
+        These tools use ChromaDB (VectorStorageBackend) for persistent storage.
         
         Args:
             user_id: The user identifier
@@ -351,7 +298,7 @@ class LangMemManager:
         Returns:
             List of tools [search_memory_tool, store_memory_tool] for this user
         """
-        if not is_langmem_enabled():
+        if not is_memory_enabled():
             return []
         
         # Check cache first
@@ -432,6 +379,31 @@ class LangMemManager:
         except Exception as e:
             logger.error(f"Error searching memories for user {user_id}: {e}")
             return []
+
+    async def search_user_memory(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 10,
+        document_type: Optional[StorageType] = None,
+    ) -> List[Dict[str, Any]]:
+        """Backward-compatible alias for callers using the singular method name."""
+        results = await self.search_user_memories(
+            user_id=user_id,
+            query=query,
+            limit=limit,
+        )
+        if document_type is None:
+            return results
+        filtered: List[Dict[str, Any]] = []
+        for item in results:
+            metadata = item.get("metadata", {})
+            if metadata.get("document_type") == document_type.value:
+                filtered.append(item)
+                continue
+            if document_type == StorageType.USER_PREFERENCE and metadata.get("preference_type"):
+                filtered.append(item)
+        return filtered
     
     async def store_user_memory(
         self,
@@ -462,6 +434,8 @@ class LangMemManager:
         
         try:
             now = datetime.now()
+            final_metadata = dict(metadata or {})
+            final_metadata.setdefault("document_type", document_type.value)
             doc = StorageDocument(
                 id=key,
                 user_id=user_id,
@@ -469,7 +443,7 @@ class LangMemManager:
                 document_type=document_type,
                 content=content,
                 embedding=None,  # Will be generated by storage backend
-                metadata=metadata or {},
+                metadata=final_metadata,
                 created_at=now,
                 updated_at=now,
             )
@@ -715,33 +689,27 @@ class LangMemManager:
 
 
 # Global singleton instance
-_langmem_manager: Optional[LangMemManager] = None
+_memory_manager: Optional[MemoryManager] = None
 
 
-def get_langmem_manager() -> LangMemManager:
-    """Get the global LangMem manager instance."""
-    global _langmem_manager
-    if _langmem_manager is None:
-        _langmem_manager = LangMemManager()
-    return _langmem_manager
-
-
-# Convenience functions for backward compatibility
-def get_memory_store():
-    """Get the LangMem store instance (for graph compilation)."""
-    return get_langmem_manager().langmem_store
+def get_memory_manager() -> MemoryManager:
+    """Get the global memory manager instance."""
+    global _memory_manager
+    if _memory_manager is None:
+        _memory_manager = MemoryManager()
+    return _memory_manager
 
 
 def get_memory_tools() -> List:
     """
     Get generic memory tools (not user-specific).
 
-    For user-specific tools, use get_langmem_manager().get_tools_for_user(user_id)
-    
+    For user-specific tools, use get_memory_manager().get_tools_for_user(user_id)
+
     Note: Generic tools use a default "anonymous" user_id.
     """
-    if not is_langmem_enabled():
+    if not is_memory_enabled():
         return []
 
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     return create_chromadb_memory_tools("anonymous", manager)
