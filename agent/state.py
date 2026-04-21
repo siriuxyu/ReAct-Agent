@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph import add_messages
@@ -61,3 +61,11 @@ class State(InputState):
     # api_connections: Dict[str, Any] = field(default_factory=dict)
     extracted_preferences: list[UserPreference] = field(default_factory=list)
     enable_preference_extraction: bool = field(default=True)
+    task_type: str = field(default="chat")
+    selected_model: str = field(default="")
+    tool_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    workspace: dict[str, Any] = field(default_factory=dict)
+    pending_confirmation: dict[str, Any] | None = field(default=None)
+    confirmed_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    confirmation_resolution: str = field(default="")
+    confirmation_response_text: str = field(default="")

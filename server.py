@@ -8,15 +8,26 @@ import json
 import os
 import uuid
 import time
+from agent.adapters import (
+    RECURSION_ERROR_MESSAGE,
+    extract_text_from_chunk,
+    is_graph_recursion_error,
+    invoke_graph,
+    persist_transcript,
+    prepare_agent_run,
+)
 from agent.graph import graph
 from agent.context import Context
+from agent.runtime import AgentRuntime, AgentRuntimeService, SessionService
 from agent.utils import setup_logging, get_logger
 from agent.memory.memory_manager import (
-    get_langmem_manager,
-    is_langmem_enabled,
+    get_memory_manager,
+    is_memory_enabled,
     is_storage_available,
 )
-from langchain_core.messages import ToolMessage, AIMessage
+from agent.memory import build_session_recall_block, get_session_store
+import auth.google_oauth as _google_oauth
+import services.scheduler as _scheduler_svc
 
 # Import LangGraph errors for proper handling
 try:
@@ -27,142 +38,34 @@ except ImportError:
 # Initialize logging
 setup_logging()
 logger = get_logger(__name__)
-
+agent_runtime = AgentRuntime()
+from agent.preference import force_extract_and_persist
 from dotenv import load_dotenv
+
 load_dotenv()
-
-
-# ---------------------------------------------------------------------------
-# Session activity tracker
-# Maps session_id → {"userid": str, "last_activity": float (epoch seconds)}
-# ---------------------------------------------------------------------------
-_active_sessions: Dict[str, Dict[str, Any]] = {}
-_session_aliases: Dict[str, str] = {}
-_finalized_sessions: set[str] = set()
-# Cache injected preferences per userid: {userid: (fetched_at_timestamp, prefs_list)}
-_pref_cache: Dict[str, tuple] = {}
-PREF_CACHE_TTL = int(os.environ.get("PREF_CACHE_TTL", 300))  # 5 min
 
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", 1800))  # 30 min
 SESSION_SWEEP_INTERVAL  = int(os.environ.get("SESSION_SWEEP_INTERVAL",  300))   # 5 min
 
-
-def _touch_session(session_id: str, userid: str) -> None:
-    """Record or refresh the last-activity timestamp for a session."""
-    effective_session_id = _resolve_session_id(session_id)
-    _active_sessions[effective_session_id] = {
-        "userid": userid,
-        "last_activity": time.time(),
-    }
-
-
-def _resolve_session_id(session_id: str) -> str:
-    """Follow any reset/timeout aliases to the current effective session id."""
-    current = session_id
-    seen = set()
-    while current in _session_aliases and current not in seen:
-        seen.add(current)
-        current = _session_aliases[current]
-    return current
-
-
-def _has_session_messages(state: Any) -> bool:
-    return bool(state and state.values and state.values.get("messages"))
-
-
-def _roll_session_forward(session_id: str, userid: str) -> str:
-    """
-    Rotate a session to a fresh underlying thread id.
-
-    The original session_id remains usable at the API layer and is aliased to the
-    new thread, so clients effectively see a cleared session.
-    """
-    effective_session_id = _resolve_session_id(session_id)
-    replacement_session_id = _build_session_id(userid)
-
-    alias_sources = [
-        alias
-        for alias in list(_session_aliases.keys())
-        if _resolve_session_id(alias) == effective_session_id
-    ]
-    alias_sources.append(session_id)
-    alias_sources.append(effective_session_id)
-    for alias in set(alias_sources):
-        if alias != replacement_session_id:
-            _session_aliases[alias] = replacement_session_id
-
-    _active_sessions.pop(session_id, None)
-    _active_sessions.pop(effective_session_id, None)
-    _finalized_sessions.discard(replacement_session_id)
-    return replacement_session_id
-
-
-async def _expire_session(session_id: str, userid: str) -> None:
-    """Force-extract preferences then remove session from the activity tracker."""
-    effective_session_id = _resolve_session_id(session_id)
-    logger.info(
-        f"Session timeout: extracting preferences for {effective_session_id}",
-        extra={"session_id": effective_session_id, "userid": userid},
-    )
-    try:
-        state = _get_session_state(effective_session_id)
-        messages = state.values.get("messages", []) if state and state.values else []
-        if (
-            messages
-            and is_langmem_enabled()
-            and effective_session_id not in _finalized_sessions
-        ):
-            from agent.preference import force_extract_and_persist
-            n = await force_extract_and_persist(
-                messages=messages,
-                user_id=userid,
-                model="anthropic/claude-haiku-4-5-20251001",
-            )
-            _finalized_sessions.add(effective_session_id)
-            logger.info(
-                f"Timeout extraction: {n} preferences saved for {effective_session_id}"
-            )
-        replacement_session_id = _roll_session_forward(effective_session_id, userid)
-        logger.info(
-            "Session expired and rolled forward",
-            extra={
-                "session_id": effective_session_id,
-                "replacement_session_id": replacement_session_id,
-                "userid": userid,
-            },
-        )
-    except Exception as e:
-        logger.warning(f"Timeout extraction failed for {effective_session_id}: {e}")
-    finally:
-        _active_sessions.pop(session_id, None)
-        _active_sessions.pop(effective_session_id, None)
-
-
-async def _session_sweep_loop() -> None:
-    """Background task: periodically expire idle sessions."""
-    logger.info(
-        f"Session sweep started (timeout={SESSION_TIMEOUT_SECONDS}s, "
-        f"interval={SESSION_SWEEP_INTERVAL}s)"
-    )
-    while True:
-        await asyncio.sleep(SESSION_SWEEP_INTERVAL)
-        now = time.time()
-        expired = [
-            (sid, info["userid"])
-            for sid, info in list(_active_sessions.items())
-            if now - info["last_activity"] > SESSION_TIMEOUT_SECONDS
-        ]
-        if expired:
-            logger.info(f"Sweeping {len(expired)} expired sessions")
-            await asyncio.gather(*[_expire_session(sid, uid) for sid, uid in expired])
+session_service = SessionService(
+    app=graph,
+    logger=logger,
+    session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+    session_sweep_interval=SESSION_SWEEP_INTERVAL,
+    is_memory_enabled_fn=is_memory_enabled,
+    get_memory_manager_fn=get_memory_manager,
+    force_extract_preferences_fn=force_extract_and_persist,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_session_sweep_loop())
+    task = asyncio.create_task(session_service.session_sweep_loop())
+    await _scheduler_svc.start()
     try:
         yield
     finally:
+        await _scheduler_svc.stop()
         task.cancel()
         try:
             await task
@@ -171,41 +74,11 @@ async def lifespan(app: FastAPI):
 
 
 api = FastAPI(
-    title="ReAct Agent API",
-    description="ReAct Agent with long-term memory support",
+    title="Cliriux Agent API",
+    description="Cliriux personal assistant with long-term memory support",
     version="2.0.0",
     lifespan=lifespan,
 )
-
-
-########################################################
-# Helpers
-########################################################
-def _content_preview(content: Union[str, List[Any]], max_chars: int = 100) -> str:
-    """Return a short text preview of a message content (str or multimodal list)."""
-    if isinstance(content, str):
-        return content[:max_chars]
-    # Multimodal list: collect text blocks, note non-text blocks
-    parts: List[str] = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append(block[:max_chars])
-        elif isinstance(block, dict):
-            btype = block.get("type", "")
-            if btype == "text":
-                parts.append(block.get("text", "")[:max_chars])
-            elif btype == "image":
-                src = block.get("source", {})
-                media = src.get("media_type", "image")
-                parts.append(f"[{media}]")
-            elif btype == "document":
-                src = block.get("source", {})
-                media = src.get("media_type", "application/pdf")
-                parts.append(f"[{media}]")
-            else:
-                parts.append(f"[{btype}]")
-    preview = " ".join(parts)
-    return preview[:max_chars]
 
 
 ########################################################
@@ -222,7 +95,7 @@ class Message(BaseModel):
     # content can be plain text OR a multimodal list of content blocks
     content: Union[str, List[ContentBlock]]
 
-class ReactRequest(BaseModel):
+class CliriuxRequest(BaseModel):
     messages: List[Message]
     userid: str        # Stable user identity — scopes long-term memory (ChromaDB)
     session_id: Optional[str] = None  # Optional: explicit short-term session; falls back to userid
@@ -242,7 +115,7 @@ class SessionResponse(BaseModel):
     userid: str
     is_new: bool  # False if session_id already existed (resume)
 
-class ReactResponse(BaseModel):
+class CliriuxResponse(BaseModel):
     messages: List[Dict[str, Any]]
     final_response: str
 
@@ -280,23 +153,153 @@ class InjectResponse(BaseModel):
 
 
 def _build_session_id(userid: str) -> str:
-    return f"{userid}_{uuid.uuid4().hex[:12]}"
+    return session_service.build_session_id(userid)
 
 
 def _is_session_owned_by_user(userid: str, session_id: str) -> bool:
-    return session_id == userid or session_id.startswith(f"{userid}_")
+    return session_service.is_session_owned_by_user(userid, session_id)
 
 
 def _session_config(session_id: str) -> Dict[str, Dict[str, str]]:
-    return {"configurable": {"thread_id": _resolve_session_id(session_id)}}
+    return session_service.session_config(session_id)
 
 
 def _get_session_state(session_id: str) -> Any:
-    return graph.get_state(_session_config(session_id))
+    return session_service.get_state(session_id)
 
 
 def _session_exists(session_id: str) -> bool:
-    return _has_session_messages(_get_session_state(session_id))
+    return session_service.session_exists(session_id)
+
+
+runtime_service = AgentRuntimeService(
+    agent_runtime=agent_runtime,
+    app=graph,
+    context_cls=Context,
+    logger=logger,
+    prepare_agent_run_fn=prepare_agent_run,
+    invoke_graph_fn=invoke_graph,
+    extract_text_fn=extract_text_from_chunk,
+    persist_transcript_fn=persist_transcript,
+    transcript_store_factory=get_session_store,
+    resolve_session_id=session_service.resolve_session_id,
+    is_session_owned_by_user=session_service.is_session_owned_by_user,
+    session_config=session_service.session_config,
+    get_session_state=session_service.get_state,
+    has_session_messages=session_service.has_session_messages,
+    is_memory_enabled_fn=is_memory_enabled,
+    get_memory_manager_fn=get_memory_manager,
+    build_session_recall_block_fn=build_session_recall_block,
+)
+
+
+def _log_invoke_request(request_id: str, req: CliriuxRequest) -> None:
+    logger.info(
+        "Received invoke request",
+        extra={
+            "request_id": request_id,
+            "user_id": req.userid,
+            "details": {
+                "message_count": len(req.messages),
+                "model": req.model or "default",
+                "memory_enabled": is_memory_enabled(),
+            },
+        },
+    )
+
+
+def _log_turn_success(
+    *,
+    event_name: str,
+    request_id: str,
+    duration_ms: float,
+    turn,
+    user_id: str | None = None,
+) -> None:
+    extra: dict[str, Any] = {
+        "request_id": request_id,
+        "duration_ms": round(duration_ms, 2),
+        "details": {
+            "chunks_processed": turn.chunk_count,
+            "response_length": len(turn.final_response),
+            "response_preview": turn.final_response[:200] if turn.final_response else None,
+        },
+    }
+    if user_id:
+        extra["user_id"] = user_id
+        extra["details"]["response_messages_count"] = len(turn.response_messages)
+    logger.info(event_name, extra=extra)
+
+
+def _log_runtime_failure(
+    *,
+    event_name: str,
+    request_id: str,
+    duration_ms: float,
+    exc: Exception,
+    user_id: str | None = None,
+) -> None:
+    extra: dict[str, Any] = {
+        "request_id": request_id,
+        "duration_ms": round(duration_ms, 2),
+    }
+    if user_id:
+        extra["user_id"] = user_id
+    logger.error(event_name, extra=extra, exc_info=True)
+
+
+def _invoke_error_response(
+    *,
+    request_id: str,
+    user_id: str,
+    duration_ms: float,
+    exc: Exception,
+) -> CliriuxResponse:
+    if is_graph_recursion_error(exc, GraphRecursionError):
+        logger.warning(
+            "Agent hit recursion limit",
+            extra={
+                "request_id": request_id,
+                "user_id": user_id,
+                "duration_ms": round(duration_ms, 2),
+                "error_type": "GraphRecursionError",
+            },
+        )
+        return CliriuxResponse(messages=[], final_response=RECURSION_ERROR_MESSAGE)
+
+    _log_runtime_failure(
+        event_name="Request failed",
+        request_id=request_id,
+        user_id=user_id,
+        duration_ms=duration_ms,
+        exc=exc,
+    )
+    return CliriuxResponse(messages=[], final_response=f"Error: {str(exc)}")
+
+
+def _touch_session(session_id: str, userid: str) -> None:
+    session_service.touch_session(session_id, userid)
+
+
+########################################################
+# Google OAuth endpoints
+########################################################
+@api.get("/auth/google")
+async def auth_google_start():
+    """引导用户授权 Google Calendar。"""
+    url, _state = _google_oauth.get_auth_url()
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=url, status_code=307)
+
+
+@api.get("/auth/google/callback")
+async def auth_google_callback(code: str, state: str):
+    """OAuth 回调，交换授权码为 token。"""
+    try:
+        _google_oauth.exchange_code(code, state)
+        return {"message": "Authorization successful. You can close this tab."}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 ########################################################
@@ -311,15 +314,13 @@ async def create_session(req: SessionCreateRequest):
     conversation history. Pass an existing session_id to resume that session.
     Omit session_id to always get a fresh session.
     """
-    session_id = req.session_id or _build_session_id(req.userid)
-    if not _is_session_owned_by_user(req.userid, session_id):
-        raise HTTPException(
-            status_code=400,
-            detail="session_id must match userid namespace",
+    try:
+        effective_session_id, is_new = session_service.create_or_resume_session(
+            req.userid,
+            req.session_id,
         )
-
-    effective_session_id = _resolve_session_id(session_id)
-    is_new = not _session_exists(effective_session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     logger.info(
         "Session created",
         extra={
@@ -338,96 +339,8 @@ async def create_session(req: SessionCreateRequest):
 ########################################################
 # Shared helpers for invoke & stream
 ########################################################
-async def _prepare_agent_run(req: ReactRequest):
-    """
-    Resolve session, inject preferences, build Context.
-    Returns (config, context, messages, effective_session_id).
-    """
-    session_id = req.session_id or req.userid
-    if not _is_session_owned_by_user(req.userid, session_id):
-        raise HTTPException(status_code=400, detail="session_id must match userid namespace")
-
-    effective_session_id = _resolve_session_id(session_id)
-    config = _session_config(effective_session_id)
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
-
-    existing_state = _get_session_state(effective_session_id)
-    is_new_session = not _has_session_messages(existing_state)
-
-    base_prompt = req.system_prompt or "You are a helpful AI assistant."
-    if is_new_session and is_langmem_enabled() and req.userid:
-        try:
-            from agent.interfaces import StorageType
-            manager = get_langmem_manager()
-            prefs = await manager.search_user_memory(
-                user_id=req.userid,
-                query="user preferences",
-                limit=10,
-                document_type=StorageType.USER_PREFERENCE,
-            )
-            if prefs:
-                lines = []
-                for p in prefs:
-                    date_str = p.get("created_at", "")[:10]  # YYYY-MM-DD
-                    date_prefix = f"[{date_str}] " if date_str else ""
-                    ptype = p.get("metadata", {}).get("preference_type", "")
-                    type_prefix = f"[{ptype}] " if ptype else ""
-                    lines.append(f"- {date_prefix}{type_prefix}{p['content']}")
-                base_prompt += "\n\n## Known user preferences\n" + "\n".join(lines)
-        except Exception as _e:
-            logger.warning(f"Failed to inject preferences: {_e}")
-
-    if req.enable_preference_extraction is not None:
-        run_extraction = req.enable_preference_extraction
-    else:
-        existing_msgs = (
-            existing_state.values.get("messages", [])
-            if existing_state and existing_state.values else []
-        )
-        from langchain_core.messages import HumanMessage as _HM
-        human_turns = sum(1 for m in existing_msgs if isinstance(m, _HM))
-        run_extraction = ((human_turns + 1) % 10 == 0)
-
-    context_kwargs = dict(
-        system_prompt=base_prompt,
-        model=req.model or "anthropic/claude-sonnet-4-5-20250929",
-        max_search_results=req.max_search_results or 10,
-        user_id=req.userid,
-        enable_preference_extraction=run_extraction,
-    )
-    if req.enable_web_search is not None:
-        context_kwargs["enable_web_search"] = req.enable_web_search
-    context = Context(**context_kwargs)
-
-    return config, context, messages, effective_session_id
-
-
-def _extract_text_from_chunk(chunk: Dict) -> Optional[str]:
-    """Pull the assistant text out of a LangGraph astream chunk, if any."""
-    for node_output in chunk.values():
-        msgs = node_output.get("messages", []) if isinstance(node_output, dict) else []
-        for msg in msgs:
-            if not isinstance(msg, AIMessage):
-                continue
-            if getattr(msg, "tool_calls", None):
-                continue
-            content = msg.content
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = [
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                text = "".join(parts)
-                if text:
-                    return text
-    return None
-
-
 async def _sse_generator(
-    req: ReactRequest, request_id: str
+    req: CliriuxRequest, request_id: str
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events:
@@ -440,18 +353,40 @@ async def _sse_generator(
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     try:
-        config, context, messages, effective_session_id = await _prepare_agent_run(req)
-        yield event({"type": "session", "session_id": effective_session_id})
+        prepared = await runtime_service.prepare_request(req)
+        yield event({"type": "session", "session_id": prepared.effective_session_id})
 
-        final_response = ""
-        async for chunk in graph.astream({"messages": messages}, config=config, context=context):
-            text = _extract_text_from_chunk(chunk)
-            if text:
-                final_response = text
-                yield event({"type": "chunk", "content": text})
+        queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
 
-        _touch_session(effective_session_id, req.userid)
-        yield event({"type": "done", "final_response": final_response})
+        async def on_text(text: str) -> None:
+            await queue.put(("chunk", text))
+
+        async def run_stream_task() -> None:
+            try:
+                result = await runtime_service.stream_prepared_request(
+                    req,
+                    prepared=prepared,
+                    on_text_fn=on_text,
+                )
+                await queue.put(("done", result.turn.final_response))
+            except Exception as exc:
+                await queue.put(("error", str(exc)))
+
+        task = asyncio.create_task(run_stream_task())
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "chunk":
+                    yield event({"type": "chunk", "content": payload})
+                    continue
+                if kind == "done":
+                    _touch_session(prepared.effective_session_id, req.userid)
+                    yield event({"type": "done", "final_response": payload})
+                    break
+                yield event({"type": "error", "message": payload})
+                break
+        finally:
+            await task
 
     except Exception as e:
         logger.error(f"SSE error [{request_id}]: {e}", exc_info=True)
@@ -462,7 +397,7 @@ async def _sse_generator(
 # Stream endpoint (SSE)
 ########################################################
 @api.post("/stream")
-async def stream(req: ReactRequest):
+async def stream(req: CliriuxRequest):
     """
     Stream agent responses as Server-Sent Events.
 
@@ -489,11 +424,11 @@ async def stream(req: ReactRequest):
 
 
 ########################################################
-# Invoke the React Agent with user context
+# Invoke Cliriux with user context
 ########################################################
-@api.post("/invoke", response_model=ReactResponse, tags=["Agent"])
-async def invoke(req: ReactRequest):
-    """Invoke the React agent with the provided messages and context.
+@api.post("/invoke", response_model=CliriuxResponse, tags=["Agent"])
+async def invoke(req: CliriuxRequest):
+    """Invoke Cliriux with the provided messages and context.
 
     userid scopes long-term memory.
     session_id scopes short-term conversation state; if omitted, userid is used
@@ -503,225 +438,37 @@ async def invoke(req: ReactRequest):
     start_time = time.time()
     
     try:
-        logger.info("Received invoke request", extra={
-            'request_id': request_id,
-            'user_id': req.userid,
-            'details': {
-                'message_count': len(req.messages),
-                'model': req.model or "default",
-                'langmem_enabled': is_langmem_enabled(),
-            }
-        })
-
-        config, context, messages, effective_session_id = await _prepare_agent_run(req)
-
-        # Stream the response from the graph
-        response_messages = []
-        final_response = ""
-        chunk_count = 0
+        _log_invoke_request(request_id, req)
 
         logger.info("Starting agent execution", extra={
             'request_id': request_id,
             'user_id': req.userid,
-            'session_id': effective_session_id,
-            'function': 'graph.astream'
+            'function': 'AgentRuntimeService.invoke_request'
         })
-        
-        async for chunk in graph.astream(
-            {"messages": messages},
-            config=config,
-            context=context
-        ):
-            chunk_count += 1
-            
-            # Debug: log chunk structure
-            logger.debug(f"Chunk received (count: {chunk_count})", extra={
-                'request_id': request_id,
-                'user_id': req.userid,
-                'details': {'chunk': str(chunk)[:200]}  # Truncate for readability
-            })
-            
-            # Handle different chunk structures
-            msgs_to_process = []
-            
-            if "messages" in chunk:
-                msgs_to_process = chunk["messages"]
-            elif "call_model" in chunk and "messages" in chunk["call_model"]:
-                msgs_to_process = chunk["call_model"]["messages"]
-                logger.debug("Processing model call chunk", extra={
-                    'request_id': request_id,
-                    'user_id': req.userid,
-                    'details': {'chunk_type': 'call_model'}
-                })
-            elif "tools" in chunk and "messages" in chunk["tools"]:
-                msgs_to_process = chunk["tools"]["messages"]
-                logger.debug("Processing tool execution chunk", extra={
-                    'request_id': request_id,
-                    'user_id': req.userid,
-                    'details': {'chunk_type': 'tools'}
-                })
-            
-            for msg in msgs_to_process:
-                # Skip ToolMessage - these contain encrypted_content from web_search
-                # and should not be returned to the user
-                if isinstance(msg, ToolMessage):
-                    logger.debug("Skipping ToolMessage", extra={
-                        'request_id': request_id,
-                        'user_id': req.userid,
-                        'details': {
-                            'message_type': 'ToolMessage',
-                            'tool_call_id': getattr(msg, 'tool_call_id', None)
-                        }
-                    })
-                    continue
-                
-                # Get message content based on message type
-                msg_content_raw = ""
-                if hasattr(msg, 'content'):
-                    msg_content_raw = msg.content
-                elif hasattr(msg, 'data') and 'content' in msg.data:
-                    msg_content_raw = msg.data['content']
-                else:
-                    msg_content_raw = str(msg)
-                
-                # Convert content to string if it's a list or other non-string type
-                msg_content = ""
-                if isinstance(msg_content_raw, str):
-                    msg_content = msg_content_raw
-                elif isinstance(msg_content_raw, list):
-                    # Handle list of content blocks (e.g., from Claude API)
-                    content_parts = []
-                    for item in msg_content_raw:
-                        if isinstance(item, str):
-                            content_parts.append(item)
-                        elif isinstance(item, dict):
-                            # Skip web_search_tool_result blocks that contain encrypted_content
-                            if item.get('type') == 'web_search_tool_result':
-                                logger.debug("Skipping web_search_tool_result block with encrypted_content", extra={
-                                    'request_id': request_id,
-                                    'user_id': req.userid
-                                })
-                                continue
-                            # Skip blocks that contain encrypted_content
-                            if 'encrypted_content' in item:
-                                logger.debug("Skipping content block with encrypted_content", extra={
-                                    'request_id': request_id,
-                                    'user_id': req.userid,
-                                    'block_type': item.get('type', 'unknown')
-                                })
-                                continue
-                            # Skip server_tool_use blocks (tool call information)
-                            if item.get('type') == 'server_tool_use':
-                                logger.debug("Skipping server_tool_use block", extra={
-                                    'request_id': request_id,
-                                    'user_id': req.userid,
-                                    'tool_name': item.get('name', 'unknown')
-                                })
-                                continue
-                            # Handle structured content blocks
-                            if item.get('type') == 'text' and 'text' in item:
-                                content_parts.append(item['text'])
-                            elif 'content' in item:
-                                # Recursively check nested content for encrypted_content
-                                nested_content = item['content']
-                                if isinstance(nested_content, list):
-                                    for nested_item in nested_content:
-                                        if isinstance(nested_item, dict) and 'encrypted_content' in nested_item:
-                                            continue  # Skip nested encrypted content
-                                        elif isinstance(nested_item, dict) and nested_item.get('type') == 'text' and 'text' in nested_item:
-                                            content_parts.append(nested_item['text'])
-                                        elif isinstance(nested_item, str):
-                                            content_parts.append(nested_item)
-                                else:
-                                    content_parts.append(str(nested_content))
-                            else:
-                                content_parts.append(str(item))
-                        else:
-                            content_parts.append(str(item))
-                    msg_content = "".join(content_parts)
-                else:
-                    msg_content = str(msg_content_raw)
-                
-                # Debug: log message content
-                logger.debug("Processing message", extra={
-                    'request_id': request_id,
-                    'user_id': req.userid,
-                    'details': {
-                        'message_type': type(msg).__name__,
-                        'has_content': hasattr(msg, 'content'),
-                        'has_tool_calls': hasattr(msg, 'tool_calls'),
-                        'content_type': type(msg_content_raw).__name__,
-                        'content_preview': str(msg_content)[:200] if msg_content else None,
-                        'tool_calls': [{'name': tc.get('name', 'unknown'), 'args': tc.get('args', {})} for tc in getattr(msg, 'tool_calls', [])[:3]]
-                    }
-                })
-                
-                # Get role
-                msg_role = "assistant"
-                if hasattr(msg, 'type'):
-                    msg_role = msg.type if msg.type in ['user', 'assistant', 'system'] else "assistant"
-                elif hasattr(msg, 'role'):
-                    msg_role = msg.role
-                
-                response_messages.append({
-                    "role": msg_role,
-                    "content": msg_content,
-                    "tool_calls": getattr(msg, 'tool_calls', None)
-                })
-                
-                # Get the final response (last non-tool message)
-                # Only update final_response for AIMessage without tool_calls
-                if isinstance(msg, AIMessage) and msg_content and not getattr(msg, 'tool_calls', None):
-                    final_response = msg_content
+        result = await runtime_service.invoke_request(req)
         
         duration_ms = (time.time() - start_time) * 1000
+        _log_turn_success(
+            event_name="Request completed successfully",
+            request_id=request_id,
+            user_id=req.userid,
+            duration_ms=duration_ms,
+            turn=result.turn,
+        )
         
-        logger.info("Request completed successfully", extra={
-            'request_id': request_id,
-            'user_id': req.userid,
-            'duration_ms': round(duration_ms, 2),
-            'details': {
-                'chunks_processed': chunk_count,
-                'response_messages_count': len(response_messages),
-                'final_response_length': len(final_response),
-                'final_response_preview': final_response[:200] if final_response else None
-            }
-        })
-        
-        _touch_session(effective_session_id, req.userid)
-        return ReactResponse(
-            messages=response_messages,
-            final_response=final_response
+        _touch_session(result.prepared.effective_session_id, req.userid)
+        return CliriuxResponse(
+            messages=result.turn.response_messages,
+            final_response=result.turn.final_response
         )
         
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
-        
-        # Check if it's a GraphRecursionError (agent called tools too many times)
-        is_recursion_error = (
-            GraphRecursionError is not None and isinstance(e, GraphRecursionError)
-        ) or "GraphRecursionError" in type(e).__name__ or "recursion limit" in str(e).lower()
-        
-        if is_recursion_error:
-            logger.warning("Agent hit recursion limit", extra={
-                'request_id': request_id,
-                'user_id': req.userid,
-                'duration_ms': round(duration_ms, 2),
-                'error_type': 'GraphRecursionError'
-            })
-            return ReactResponse(
-                messages=[],
-                final_response="Error: Agent reached maximum tool call limit (25 iterations). The question may be too complex or require information not available in memory."
-            )
-        
-        logger.error("Request failed", extra={
-            'request_id': request_id,
-            'user_id': req.userid,
-            'duration_ms': round(duration_ms, 2)
-        }, exc_info=True)
-        return ReactResponse(
-            messages=[],
-            final_response=f"Error: {str(e)}"
+        return _invoke_error_response(
+            request_id=request_id,
+            user_id=req.userid,
+            duration_ms=duration_ms,
+            exc=e,
         )
 
 
@@ -735,179 +482,49 @@ async def chat(req: ChatRequest):
     start_time = time.time()
     
     try:
-        logger.info("Received chat request", extra={
-            'request_id': request_id,
-            'details': {
-                'message_length': len(req.message),
-                'message_preview': req.message[:100]
-            }
-        })
-        
-        messages = [{"role": "user", "content": req.message}]
-        
-        # Generate a unique temporary thread_id for this single-use chat
-        temp_thread_id = f"temp_{uuid.uuid4().hex}"
-        
-        context = Context(
-            system_prompt="You are a helpful AI assistant.",
-            model="anthropic/claude-sonnet-4-5-20250929",
-            user_id=temp_thread_id,  # Use temp_thread_id as user_id for memory
+        logger.info(
+            "Received chat request",
+            extra={
+                "request_id": request_id,
+                "details": {
+                    "message_length": len(req.message),
+                    "message_preview": req.message[:100],
+                },
+            },
         )
         
-        config = {"configurable": {"thread_id": temp_thread_id}}
-        
+        temp_thread_id = f"temp_{uuid.uuid4().hex}"
+
         logger.debug("Starting chat execution", extra={
             'request_id': request_id,
             'details': {'temp_thread_id': temp_thread_id}
         })
-        
-        final_response = ""
-        chunk_count = 0
-        
-        async for chunk in graph.astream(
-            {"messages": messages},
-            config=config,
-            context=context
-        ):
-            chunk_count += 1
-            
-            # Debug: log chunk structure
-            logger.debug(f"Chat chunk received (count: {chunk_count})", extra={
-                'request_id': request_id,
-                'details': {'chunk': str(chunk)[:200]}
-            })
-            
-            # Handle different chunk structures
-            msgs_to_process = []
-            
-            if "messages" in chunk:
-                msgs_to_process = chunk["messages"]
-            elif "call_model" in chunk and "messages" in chunk["call_model"]:
-                msgs_to_process = chunk["call_model"]["messages"]
-            elif "tools" in chunk and "messages" in chunk["tools"]:
-                msgs_to_process = chunk["tools"]["messages"]
-            
-            for msg in msgs_to_process:
-                # Skip ToolMessage - these contain encrypted_content from web_search
-                # and should not be returned to the user
-                if isinstance(msg, ToolMessage):
-                    logger.debug("Skipping ToolMessage in chat", extra={
-                        'request_id': request_id,
-                        'details': {
-                            'message_type': 'ToolMessage',
-                            'tool_call_id': getattr(msg, 'tool_call_id', None)
-                        }
-                    })
-                    continue
-                
-                # Debug: log message structure
-                logger.debug("Processing chat message", extra={
-                    'request_id': request_id,
-                    'details': {
-                        'message_type': type(msg).__name__,
-                        'has_content': hasattr(msg, 'content'),
-                        'has_tool_calls': hasattr(msg, 'tool_calls')
-                    }
-                })
-                
-                # Get message content based on message type
-                msg_content_raw = ""
-                if hasattr(msg, 'content'):
-                    msg_content_raw = msg.content
-                elif hasattr(msg, 'data') and 'content' in msg.data:
-                    msg_content_raw = msg.data['content']
-                else:
-                    msg_content_raw = str(msg)
-                
-                # Convert content to string if it's a list or other non-string type
-                msg_content = ""
-                if isinstance(msg_content_raw, str):
-                    msg_content = msg_content_raw
-                elif isinstance(msg_content_raw, list):
-                    # Handle list of content blocks (e.g., from Claude API)
-                    content_parts = []
-                    for item in msg_content_raw:
-                        if isinstance(item, str):
-                            content_parts.append(item)
-                        elif isinstance(item, dict):
-                            # Skip web_search_tool_result blocks that contain encrypted_content
-                            if item.get('type') == 'web_search_tool_result':
-                                logger.debug("Skipping web_search_tool_result block with encrypted_content in chat", extra={
-                                    'request_id': request_id
-                                })
-                                continue
-                            # Skip blocks that contain encrypted_content
-                            if 'encrypted_content' in item:
-                                logger.debug("Skipping content block with encrypted_content in chat", extra={
-                                    'request_id': request_id,
-                                    'block_type': item.get('type', 'unknown')
-                                })
-                                continue
-                            # Skip server_tool_use blocks (tool call information)
-                            if item.get('type') == 'server_tool_use':
-                                logger.debug("Skipping server_tool_use block in chat", extra={
-                                    'request_id': request_id,
-                                    'tool_name': item.get('name', 'unknown')
-                                })
-                                continue
-                            # Handle structured content blocks
-                            if item.get('type') == 'text' and 'text' in item:
-                                content_parts.append(item['text'])
-                            elif 'content' in item:
-                                # Recursively check nested content for encrypted_content
-                                nested_content = item['content']
-                                if isinstance(nested_content, list):
-                                    for nested_item in nested_content:
-                                        if isinstance(nested_item, dict) and 'encrypted_content' in nested_item:
-                                            continue  # Skip nested encrypted content
-                                        elif isinstance(nested_item, dict) and nested_item.get('type') == 'text' and 'text' in nested_item:
-                                            content_parts.append(nested_item['text'])
-                                        elif isinstance(nested_item, str):
-                                            content_parts.append(nested_item)
-                                else:
-                                    content_parts.append(str(nested_content))
-                            else:
-                                content_parts.append(str(item))
-                        else:
-                            content_parts.append(str(item))
-                    msg_content = "".join(content_parts)
-                else:
-                    msg_content = str(msg_content_raw)
-                
-                # Debug: log message content
-                logger.debug("Chat message content", extra={
-                    'request_id': request_id,
-                    'details': {
-                        'content_preview': str(msg_content)[:200] if msg_content else None,
-                        'tool_calls': [{'name': tc.get('name', 'unknown'), 'args': tc.get('args', {})} for tc in getattr(msg, 'tool_calls', [])[:3]]
-                    }
-                })
-                
-                # Get final response (last non-tool message)
-                # Only update final_response for AIMessage without tool_calls
-                if isinstance(msg, AIMessage) and msg_content and not getattr(msg, 'tool_calls', None):
-                    final_response = msg_content
+
+        turn = await runtime_service.invoke_chat_request(
+            message=req.message,
+            user_id=temp_thread_id,
+            system_prompt="You are a helpful AI assistant.",
+            model="anthropic/claude-sonnet-4-5-20250929",
+        )
         
         duration_ms = (time.time() - start_time) * 1000
+        _log_turn_success(
+            event_name="Chat request completed",
+            request_id=request_id,
+            duration_ms=duration_ms,
+            turn=turn,
+        )
         
-        logger.info("Chat request completed", extra={
-            'request_id': request_id,
-            'duration_ms': round(duration_ms, 2),
-            'details': {
-                'chunks_processed': chunk_count,
-                'response_length': len(final_response),
-                'response_preview': final_response[:200] if final_response else None
-            }
-        })
-        
-        return {"response": final_response}
+        return {"response": turn.final_response}
         
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
-        logger.error("Chat request failed", extra={
-            'request_id': request_id,
-            'duration_ms': round(duration_ms, 2)
-        }, exc_info=True)
+        _log_runtime_failure(
+            event_name="Chat request failed",
+            request_id=request_id,
+            duration_ms=duration_ms,
+            exc=e,
+        )
         return {"response": f"Error: {str(e)}"}
 
 
@@ -918,8 +535,8 @@ async def chat(req: ChatRequest):
 async def check_session_state(session_id: str):
     """Check the conversation state for a specific session."""
     try:
-        effective_session_id = _resolve_session_id(session_id)
-        state = _get_session_state(effective_session_id)
+        effective_session_id = session_service.resolve_session_id(session_id)
+        state = session_service.get_state(effective_session_id)
         
         if state:
             return {
@@ -958,86 +575,19 @@ async def reset_short_term_session(
         session_id: The session identifier
         userid: Optional user identifier for clearing long-term memory
         preserve_memory: If True (default), keep long-term memories intact.
-                        If False, also clear LangMem memories.
+                        If False, also clear long-term memories.
     
     This clears the checkpoint state but optionally preserves long-term memories.
     """
-    request_id = uuid.uuid4().hex
-    memory_userid = userid or session_id
-    
     try:
-        effective_session_id = _resolve_session_id(session_id)
-        logger.info(f"Resetting session {effective_session_id}", extra={
-            'request_id': request_id,
-            'user_id': memory_userid,
-            'session_id': effective_session_id,
-            'preserve_memory': preserve_memory,
-        })
-        
-        current_state = _get_session_state(effective_session_id)
-        current_messages = []
-        if current_state and current_state.values:
-            current_messages = current_state.values.get("messages", [])
-        message_count = len(current_messages)
-
-        # Force preference extraction before wiping the session
-        prefs_extracted = 0
-        if (
-            preserve_memory
-            and userid
-            and is_langmem_enabled()
-            and current_messages
-            and effective_session_id not in _finalized_sessions
-        ):
-            from agent.preference import force_extract_and_persist
-            _pref_model = model or "anthropic/claude-haiku-4-5-20251001"
-            try:
-                prefs_extracted = await force_extract_and_persist(
-                    messages=current_messages,
-                    user_id=userid,
-                    model=_pref_model,
-                )
-            except Exception as e:
-                logger.warning(f"force_extract_and_persist failed: {e}")
-            _finalized_sessions.add(effective_session_id)
-
-        # If not preserving memory, clear LangMem instead
-        memory_cleared = False
-        if not preserve_memory and is_langmem_enabled() and userid:
-            manager = get_langmem_manager()
-            memory_cleared = await manager.clear_user_memories(userid)
-
-        replacement_session_id = _roll_session_forward(
-            effective_session_id,
-            userid or memory_userid,
+        return await session_service.reset_session(
+            session_id=session_id,
+            userid=userid,
+            preserve_memory=preserve_memory,
+            model=model,
         )
-        
-        logger.info(f"Session reset for {effective_session_id}", extra={
-            'request_id': request_id,
-            'user_id': memory_userid,
-            'session_id': effective_session_id,
-            'replacement_session_id': replacement_session_id,
-            'messages_cleared': message_count,
-            'memory_cleared': memory_cleared,
-        })
-        
-        return {
-            "status": "success",
-            "userid": userid,
-            "session_id": session_id,
-            "effective_session_id": effective_session_id,
-            "replacement_session_id": replacement_session_id,
-            "messages_cleared": message_count,
-            "preferences_extracted": prefs_extracted,
-            "memory_cleared": memory_cleared,
-        }
-        
     except Exception as e:
-        logger.error(f"Failed to reset session for {session_id}: {e}", extra={
-            'request_id': request_id,
-            'user_id': memory_userid,
-            'session_id': session_id,
-        }, exc_info=True)
+        logger.error(f"Failed to reset session for {session_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1066,13 +616,13 @@ async def inject_memory(userid: str, req: InjectRequest):
     Useful for bulk-loading conversation history, documents, or notes without
     going through the agent conversation flow.
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
 
     from agent.interfaces import StorageType
-    from agent.memory.memory_manager import get_langmem_manager
+    from agent.memory.memory_manager import get_memory_manager
 
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     content = req.content.strip()
     if not content:
         raise HTTPException(status_code=400, detail="content must not be empty")
@@ -1182,7 +732,7 @@ def _split_into_chunks(text: str, chunk_size: int) -> List[str]:
 
 
 ########################################################
-# LangMem Memory Management Endpoints
+# Memory Management Endpoints
 ########################################################
 @api.get("/memory/{userid}", tags=["Memory"])
 async def list_memories(userid: str, limit: int = 100):
@@ -1193,10 +743,10 @@ async def list_memories(userid: str, limit: int = 100):
         userid: The user identifier
         limit: Maximum number of memories to return (default: 100)
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
     
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     memories = await manager.list_user_memories(userid, limit=limit)
     
     return {
@@ -1215,10 +765,10 @@ async def search_memories(userid: str, req: MemorySearchRequest):
         userid: The user identifier
         req: Search request with query and limit
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
     
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     results = await manager.search_user_memories(
         userid,
         query=req.query,
@@ -1242,11 +792,11 @@ async def store_memory(userid: str, req: MemoryStoreRequest):
         userid: The user identifier
         req: Store request with key and content
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
     
     from agent.interfaces import StorageType
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     doc_type = StorageType.LONG_TERM_CONTEXT
     if req.document_type:
         try:
@@ -1279,10 +829,10 @@ async def delete_memory(userid: str, key: str):
         userid: The user identifier
         key: Memory key to delete
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
     
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     success = await manager.delete_user_memory(userid, key)
     
     if not success:
@@ -1303,10 +853,10 @@ async def clear_memories(userid: str):
     Args:
         userid: The user identifier
     """
-    if not is_langmem_enabled():
-        raise HTTPException(status_code=503, detail="LangMem is not enabled")
+    if not is_memory_enabled():
+        raise HTTPException(status_code=503, detail="Memory is not enabled")
     
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     success = await manager.clear_user_memories(userid)
     
     if not success:
@@ -1327,19 +877,19 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "langmem_enabled": is_langmem_enabled(),
+        "memory_enabled": is_memory_enabled(),
     }
 
 
 @api.get("/status", tags=["System"])
 async def status():
-    """Get system status including LangMem and storage configuration."""
-    manager = get_langmem_manager()
+    """Get system status including memory and storage configuration."""
+    manager = get_memory_manager()
     
     return {
         "status": "running",
-        "langmem": {
-            "enabled": is_langmem_enabled(),
+        "memory": {
+            "enabled": is_memory_enabled(),
             "available": manager.is_available,
         },
         "storage": {
@@ -1375,7 +925,7 @@ async def storage_stats(userid: Optional[str] = None):
     if not is_storage_available():
         raise HTTPException(status_code=503, detail="Storage backend not available")
     
-    manager = get_langmem_manager()
+    manager = get_memory_manager()
     stats = await manager.get_storage_stats(userid)
     
     return stats
@@ -1386,6 +936,6 @@ async def storage_stats(userid: Optional[str] = None):
 ########################################################
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting React Agent server on http://0.0.0.0:8000")
-    logger.info(f"LangMem enabled: {is_langmem_enabled()}")
+    logger.info("Starting Cliriux server on http://0.0.0.0:8000")
+    logger.info(f"Memory enabled: {is_memory_enabled()}")
     uvicorn.run(api, host="0.0.0.0", port=8000)

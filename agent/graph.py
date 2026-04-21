@@ -1,475 +1,160 @@
-"""Define a custom Reasoning and Action agent with LangMem integration.
+"""LangGraph backend wiring for the shared agent runtime."""
 
-Works with a chat model with tool calling support.
-Includes long-term memory management through LangMem.
-"""
+from __future__ import annotations
 
 import os
 import sys
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, cast, Optional
+from datetime import timezone
 
-# Load environment variables FIRST before any other imports
 from dotenv import load_dotenv
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph
+
+from .context import Context
+from .preference import extract_preferences
+from .runtime import (
+    AgentRuntime,
+    collect_tool_outputs_node,
+    confirmation_cancelled_node,
+    create_call_model_node,
+    create_model_output_route,
+    create_planner_node,
+    create_tools_node,
+    route_after_planner,
+)
+from .state import InputState, State
+from .utils import get_logger
+from tools import get_tool_registry
+
 load_dotenv()
 
-# LangSmith tracing — enabled automatically when LANGCHAIN_TRACING_V2=true.
-# No code changes needed; LangGraph hooks into LangChain's callback system.
-# Set the following env vars to activate:
-#   LANGCHAIN_TRACING_V2=true
-#   LANGCHAIN_API_KEY=<your-key>
-#   LANGCHAIN_PROJECT=react-agent
 _tracing_enabled = os.environ.get("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1")
 
-# Python version compatibility for UTC
 if sys.version_info >= (3, 11):
     from datetime import UTC
 else:
     UTC = timezone.utc
 
-from langchain_core.messages import AIMessage
-from langgraph.graph import StateGraph
-from langgraph.prebuilt import ToolNode
-from langgraph.runtime import Runtime
-from langgraph.checkpoint.memory import MemorySaver
 
-from .context import Context
-from .state import InputState, State
-from .utils import get_logger, load_chat_model
-from tools import TOOLS
-from tools.save_preference import make_save_preference
-from .preference import extract_preferences
-# Lazy import to avoid circular imports and startup issues
-def is_langmem_enabled():
+def is_memory_enabled():
     try:
-        from .memory.memory_manager import is_langmem_enabled as _is_langmem_enabled
-        return _is_langmem_enabled()
+        from .memory.memory_manager import is_memory_enabled as _is_memory_enabled
+
+        return _is_memory_enabled()
     except Exception:
         return False
+
 
 def is_storage_available():
     try:
         from .memory.memory_manager import is_storage_available as _is_storage_available
+
         return _is_storage_available()
     except Exception:
         return False
 
-def get_langmem_manager():
+
+def get_memory_manager():
     try:
-        from .memory.memory_manager import get_langmem_manager as _get_langmem_manager
-        return _get_langmem_manager()
+        from .memory.memory_manager import get_memory_manager as _get_memory_manager
+
+        return _get_memory_manager()
     except Exception:
         return None
 
-# Import checkpointers - skip Redis to avoid connection issues
+
 RedisSaver = None
 redis = None
 
-# Initialize logger
 logger = get_logger(__name__)
+runtime_facade = AgentRuntime()
+tool_registry = get_tool_registry()
 logger.info(
     "LangSmith tracing %s",
     f"enabled (project={os.environ.get('LANGCHAIN_PROJECT', 'default')})"
-    if _tracing_enabled else "disabled (set LANGCHAIN_TRACING_V2=true to enable)",
+    if _tracing_enabled
+    else "disabled (set LANGCHAIN_TRACING_V2=true to enable)",
 )
 
+call_model = create_call_model_node(
+    runtime_facade=runtime_facade,
+    tool_registry=tool_registry,
+    logger=logger,
+    is_memory_enabled_fn=is_memory_enabled,
+    is_storage_available_fn=is_storage_available,
+    get_memory_manager_fn=get_memory_manager,
+)
+plan_next_step = create_planner_node(runtime_facade=runtime_facade, logger=logger)
+execute_tools = create_tools_node(
+    tool_registry=tool_registry,
+    logger=logger,
+    is_memory_enabled_fn=is_memory_enabled,
+    get_memory_manager_fn=get_memory_manager,
+)
+collect_tool_outputs = collect_tool_outputs_node
+respond_to_cancelled_confirmation = confirmation_cancelled_node
+route_model_output = create_model_output_route(logger=logger)
 
-def get_tools_with_memory(user_id: Optional[str] = None) -> List:
-    """
-    Get the combined list of tools including LangMem tools for a user.
-    
-    Args:
-        user_id: If provided, include user-specific memory tools
-        
-    Returns:
-        List of all available tools
-    """
-    all_tools = list(TOOLS)  # Start with base tools
-    
-    if is_langmem_enabled() and user_id:
-        manager = get_langmem_manager()
-        memory_tools = manager.get_tools_for_user(user_id)
-        all_tools.extend(memory_tools)
-        # Layer 2: Proactive save_preference tool
-        all_tools.append(make_save_preference(user_id))
-        logger.debug(
-            f"Added {len(memory_tools)} LangMem tools + save_preference for user {user_id}",
-            extra={"function": "get_tools_with_memory", "user_id": user_id}
-        )
-    
-    return all_tools
-
-
-async def call_model(
-    state: State, runtime: Runtime[Context]
-) -> Dict[str, List[AIMessage]]:
-    """Call the LLM powering our "agent".
-
-    This function prepares the prompt, initializes the model, and processes the response.
-    Includes LangMem tools based on user_id from config.
-
-    Args:
-        state (State): The current state of the conversation.
-        runtime (Runtime[Context]): Runtime context for the model.
-
-    Returns:
-        dict: A dictionary containing the model's response message.
-    """
-    start_time = time.time()
-    
-    # Extract context from runtime
-    context = runtime.context
-    
-    # Get user_id from context (set by server when creating the context)
-    user_id = context.user_id if context and context.user_id else None
-    
-    logger.info("Calling model", extra={
-        'function': 'call_model',
-        'details': {
-            'model': context.model,
-            'message_count': len(state.messages),
-            'is_last_step': state.is_last_step,
-            'user_id': user_id,
-            'langmem_enabled': is_langmem_enabled(),
-            'storage_available': is_storage_available(),
-        }
-    })
-    
-    # Get tools including LangMem tools for this user
-    tools = get_tools_with_memory(user_id)
-    
-    # Load the base model
-    base_model = load_chat_model(context.model)
-    
-    # Add Claude's built-in web search tool if enabled and using Anthropic model
-    if context.enable_web_search and context.model.startswith("anthropic/"):
-        try:
-            from langchain_anthropic import ChatAnthropic
-            if isinstance(base_model, ChatAnthropic):
-                # For Anthropic models, web search is added via the tools parameter
-                # Create web search tool definition
-                web_search_tool_def = {
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": context.web_search_max_uses
-                }
-                
-                # For Anthropic API, web search tool needs to be passed along with custom tools
-                # We need to combine custom tools with web search tool in the tools parameter
-                # The bind_tools method handles custom tools, but we need to add web search
-                # We'll try to access the bound tools and add web search to them
-                model = base_model.bind_tools(tools)
-                
-                # Store web search tool definition
-                # We'll try to add it via the model's kwargs if possible
-                model._anthropic_web_search = web_search_tool_def
-                
-                # Try to add web search tool to the model's bound kwargs
-                # RunnableBinding uses 'kwargs' attribute, not 'bound_kwargs'
-                if hasattr(model, 'kwargs') and isinstance(model.kwargs, dict):
-                    # Get existing tools from kwargs if any
-                    existing_tools = model.kwargs.get('tools', [])
-                    # Convert to list if needed
-                    if not isinstance(existing_tools, list):
-                        existing_tools = []
-                    # Add web search tool
-                    existing_tools.append(web_search_tool_def)
-                    model.kwargs['tools'] = existing_tools
-                
-                logger.info("Web search enabled for Claude model", extra={
-                    'function': 'call_model',
-                    'details': {
-                        'web_search_max_uses': context.web_search_max_uses,
-                        'model': context.model
-                    }
-                })
-            else:
-                model = base_model.bind_tools(tools)
-        except Exception as e:
-            logger.warning(f"Failed to enable web search: {e}, falling back to regular tools", extra={
-                'function': 'call_model',
-                'error': str(e)
-            })
-            model = base_model.bind_tools(tools)
-    else:
-        # Initialize the model with tool binding (no web search)
-        model = base_model.bind_tools(tools)
-    
-    logger.debug("Model loaded and tools bound", extra={
-        'function': 'call_model',
-        'details': {
-            'model': context.model,
-            'available_tools': [getattr(tool, 'name', str(tool)) for tool in tools],
-            'total_tools': len(tools),
-        }
-    })
-
-    # Format the system prompt with memory context
-    system_message = context.system_prompt.format(
-        system_time=datetime.now(tz=UTC).isoformat()
-    )
-    
-    # Enhance system prompt with memory search hint if LangMem is enabled
-    if is_langmem_enabled() and user_id:
-        system_message += (
-            "\n\nYou have access to long-term memory. "
-            "Use 'search_memory' to recall relevant information from past conversations."
-        )
-    
-    logger.debug("Prepared system prompt", extra={
-        'function': 'call_model',
-        'details': {
-            'system_prompt_length': len(system_message),
-            'system_time': datetime.now(tz=UTC).isoformat()
-        }
-    })
-
-    # Get the model's response
-    logger.debug("Invoking model", extra={
-        'function': 'call_model',
-        'details': {
-            'total_messages': len(state.messages) + 1  # +1 for system message
-        }
-    })
-    
-    # Context compression: summarize old messages when conversation grows long
-    from agent.summarizer import needs_compression, compress_messages
-    messages_to_use = state.messages
-    if needs_compression(state.messages):
-        logger.info("Compressing long context", extra={
-            'function': 'call_model',
-            'details': {'message_count': len(state.messages)}
-        })
-        messages_to_use = await compress_messages(state.messages, model=context.model)
-
-    # Prepare invocation messages
-    invoke_messages = [{"role": "system", "content": system_message}, *messages_to_use]
-
-    # Note: Web search tool is stored in model._anthropic_web_search if enabled
-    # The bind_tools method handles custom tools, but web search needs special handling
-    # For now, we'll rely on the model's internal mechanism to handle web search
-    # If web search is not working, we may need to modify how tools are passed to the API
-    
-    # Invoke with retry on 429 rate-limit errors
-    _max_retries = 4
-    for _attempt in range(_max_retries):
-        try:
-            response = cast(AIMessage, await model.ainvoke(invoke_messages))
-            break
-        except Exception as _e:
-            _err_str = str(_e).lower()
-            if "429" in _err_str or "rate limit" in _err_str or "overloaded" in _err_str:
-                if _attempt < _max_retries - 1:
-                    _wait = 2 ** (_attempt + 1)  # 2s, 4s, 8s, 16s
-                    logger.warning(
-                        f"Rate limit hit (attempt {_attempt+1}/{_max_retries}), retrying in {_wait}s",
-                        extra={'function': 'call_model', 'details': {'error': str(_e)}}
-                    )
-                    import asyncio as _asyncio
-                    await _asyncio.sleep(_wait)
-                else:
-                    raise
-            else:
-                raise
-    
-    model_duration_ms = (time.time() - start_time) * 1000
-    
-    logger.info("Model response received", extra={
-        'function': 'call_model',
-        'duration_ms': round(model_duration_ms, 2),
-        'details': {
-            'has_tool_calls': bool(response.tool_calls),
-            'tool_calls_count': len(response.tool_calls) if response.tool_calls else 0,
-            'response_length': len(response.content) if response.content else 0,
-            'response_preview': response.content[:200] if response.content else None
-        }
-    })
-    
-    # Log tool calls if present
-    if response.tool_calls:
-        logger.debug("Model requested tool calls", extra={
-            'function': 'call_model',
-            'details': {
-                'tool_calls': [
-                    {
-                        'name': tc.get('name', 'unknown'),
-                        'args_preview': {k: str(v)[:50] for k, v in tc.get('args', {}).items()}
-                    }
-                    for tc in response.tool_calls
-                ]
-            }
-        })
-
-    # Handle the case when it's the last step and the model still wants to use a tool
-    if state.is_last_step and response.tool_calls:
-        logger.warning("Model requested tools on last step, returning fallback message", extra={
-            'function': 'call_model',
-            'details': {
-                'tool_calls_count': len(response.tool_calls)
-            }
-        })
-        return {
-            "messages": [
-                AIMessage(
-                    id=response.id,
-                    content="Sorry, I could not find an answer to your question in the specified number of steps.",
-                )
-            ]
-        }
-
-    # Propagate context flag to state so route_model_output can read it
-    return {
-        "messages": [response],
-        "enable_preference_extraction": context.enable_preference_extraction,
-    }
-
-
-async def execute_tools(
-    state: State,
-    runtime: Runtime[Context],
-) -> Dict[str, Any]:
-    """
-    Execute tools dynamically, including user-specific memory tools.
-    
-    This function replaces the static ToolNode to allow dynamic tool selection
-    based on the user_id from context.
-    """
-    # Get user_id from context
-    context = runtime.context
-    user_id = context.user_id if context and context.user_id else None
-    
-    # Get all tools including memory tools for this user
-    all_tools = get_tools_with_memory(user_id)
-    
-    tool_names = [getattr(t, 'name', str(t)) for t in all_tools]
-    logger.info(f"Executing tools for user {user_id}", extra={
-        'function': 'execute_tools',
-        'details': {
-            'user_id': user_id,
-            'available_tools': tool_names,
-            'total_tools': len(all_tools),
-        }
-    })
-    
-    # Create a ToolNode with all tools and execute
-    # ToolNode expects a dict with "messages" key containing the conversation
-    tool_node = ToolNode(all_tools)
-    
-    # Convert state to dict format that ToolNode expects
-    state_dict = {"messages": state.messages}
-    result = await tool_node.ainvoke(state_dict)
-    
-    return result
-
-
-# Define a new graph
 builder = StateGraph(State, input_schema=InputState, context_schema=Context)
-
-# Define the nodes
+builder.add_node("planner", plan_next_step)
 builder.add_node(call_model)
-builder.add_node("tools", execute_tools)  # Dynamic tools node with memory support
+builder.add_node("tools", execute_tools)
+builder.add_node("collect_tool_outputs", collect_tool_outputs)
+builder.add_node("confirmation_cancelled", respond_to_cancelled_confirmation)
 builder.add_node("extract_preferences", extract_preferences)
 
-# Set the entrypoint
-builder.add_edge("__start__", "call_model")
-
-
-def route_model_output(state: State) -> Literal["__end__", "tools", "extract_preferences"]:
-    """Determine the next node based on the model's output.
-
-    This function checks if the model's last message contains tool calls.
-
-    Args:
-        state (State): The current state of the conversation.
-
-    Returns:
-        str: The name of the next node to call.
-    """
-    last_message = state.messages[-1]
-    if not isinstance(last_message, AIMessage):
-        raise ValueError(
-            f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
-        )
-    
-    has_tool_calls = bool(last_message.tool_calls)
-    
-    logger.debug("Routing model output", extra={
-        'function': 'route_model_output',
-        'details': {
-            'has_tool_calls': has_tool_calls,
-            'tool_calls_count': len(last_message.tool_calls) if last_message.tool_calls else 0
-        }
-    })
-    
-    # If there is no tool call, then we finish
-    if not has_tool_calls:
-        if not state.enable_preference_extraction:
-            return "__end__"
-        logger.info("No tool calls detected, routing to preference extraction", extra={
-            'function': 'route_model_output',
-            'details': {'next_node': 'extract_preferences'}
-        })
-        return "extract_preferences"
-    
-    # Otherwise we execute the requested actions
-    logger.info("Tool calls detected, routing to tools", extra={
-        'function': 'route_model_output',
-        'details': {
-            'next_node': 'tools',
-            'tool_calls': [
-                {'name': tc.get('name', 'unknown')} 
-                for tc in last_message.tool_calls[:3]  # Log first 3 tools
-            ]
-        }
-    })
-    return "tools"
-
-
-# Add conditional edge
+builder.add_edge("__start__", "planner")
+builder.add_conditional_edges(
+    "planner",
+    route_after_planner,
+    {
+        "call_model": "call_model",
+        "tools": "tools",
+        "confirmation_cancelled": "confirmation_cancelled",
+    },
+)
 builder.add_conditional_edges(
     "call_model",
     route_model_output,
-    {"tools": "tools", "extract_preferences": "extract_preferences", "__end__": "__end__"}
+    {"tools": "tools", "extract_preferences": "extract_preferences", "__end__": "__end__"},
 )
-
-# Add edge from tools back to call_model
-builder.add_edge("tools", "call_model")
+builder.add_edge("tools", "collect_tool_outputs")
+builder.add_edge("collect_tool_outputs", "call_model")
+builder.add_edge("confirmation_cancelled", "__end__")
 builder.add_edge("extract_preferences", "__end__")
 
-# Set up checkpoint storage: RedisSaver if REDIS_URL is set, else MemorySaver
 _redis_url = os.environ.get("REDIS_URL")
 if _redis_url:
     try:
         from langgraph.checkpoint.redis import RedisSaver
+
         checkpointer = RedisSaver.from_conn_string(_redis_url)
-        checkpointer.setup()  # create indexes (idempotent)
+        checkpointer.setup()
         logger.info("Using Redis checkpointer", extra={"redis_url": _redis_url})
-    except Exception as _e:
-        logger.warning(f"Redis checkpointer unavailable ({_e}), falling back to MemorySaver")
+    except Exception as exc:
+        logger.warning(f"Redis checkpointer unavailable ({exc}), falling back to MemorySaver")
         checkpointer = MemorySaver()
 else:
     logger.info("Using in-memory checkpointer (set REDIS_URL to persist sessions)")
     checkpointer = MemorySaver()
 
-# Log storage configuration (deferred to avoid import issues)
 try:
-    langmem_manager = get_langmem_manager()
+    memory_manager = get_memory_manager()
     logger.info(
         "Memory configuration",
         extra={
-            "langmem_enabled": is_langmem_enabled(),
+            "memory_enabled": is_memory_enabled(),
             "storage_available": is_storage_available(),
-            "has_persistent_storage": langmem_manager.has_persistent_storage if langmem_manager else False,
-        }
+            "has_persistent_storage": (
+                memory_manager.has_persistent_storage if memory_manager else False
+            ),
+        },
     )
-except Exception as e:
-    logger.warning(f"Could not initialize LangMem manager: {e}")
+except Exception as exc:
+    logger.warning(f"Could not initialize memory manager: {exc}")
 
-# Compile the builder into an executable graph with checkpointer only
-# Note: We use ChromaDB for persistent storage instead of LangMem's InMemoryStore
 logger.info("Compiling graph with checkpointer")
 graph = builder.compile(
-    name="ReAct Agent",
+    name="Cliriux Agent",
     checkpointer=checkpointer,
 )

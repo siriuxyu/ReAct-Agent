@@ -224,6 +224,7 @@ def get_message_text(msg: BaseMessage) -> str:
         return "".join(txts).strip()
 
 
+
 def load_chat_model(fully_specified_name: str, tools: Optional[List] = None) -> BaseChatModel:
     """Load a chat model from a fully specified name.
 
@@ -231,8 +232,10 @@ def load_chat_model(fully_specified_name: str, tools: Optional[List] = None) -> 
         fully_specified_name (str): String in the format 'provider/model'.
         tools: Optional list of tools to include (for web search, etc.)
     """
-    provider, model = fully_specified_name.split("/", maxsplit=1)
-    base_model = init_chat_model(model, model_provider=provider)
+    from agent.model_router import load_provider_model
+
+    provider, _model = fully_specified_name.split("/", maxsplit=1)
+    base_model = load_provider_model(fully_specified_name)
     
     # If tools are provided and this is an Anthropic model, add web search tool
     if tools is not None and provider == "anthropic":
