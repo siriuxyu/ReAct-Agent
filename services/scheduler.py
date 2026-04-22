@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import uuid
 from datetime import datetime
@@ -8,6 +9,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.asyncio import AsyncIOExecutor
+
+logger = logging.getLogger(__name__)
 
 _scheduler: Optional[AsyncIOScheduler] = None
 
@@ -58,7 +61,12 @@ def add_job(func: Callable, run_at: datetime, job_id: Optional[str] = None, args
             args=args or [],
             replace_existing=True,
         )
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logger.warning(
+            "SQLite serialization failed for job %s (%s), falling back to memory store",
+            job_id,
+            e,
+        )
         scheduler.add_job(
             func,
             trigger="date",

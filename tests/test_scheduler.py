@@ -7,6 +7,11 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 
 
+async def _module_level_noop():
+    """模块级函数，可被 APScheduler SQLite jobstore 序列化。"""
+    pass
+
+
 @pytest.mark.asyncio
 async def test_scheduler_starts_and_stops(tmp_path):
     """start()/stop() 不抛异常，state 正确切换。"""
@@ -59,5 +64,30 @@ async def test_list_jobs(tmp_path):
         jobs = mod.list_jobs()
         ids = [j["id"] for j in jobs]
         assert "list-test-job" in ids
+
+        await mod.stop()
+
+
+@pytest.mark.asyncio
+async def test_add_job_writes_to_sqlite(tmp_path):
+    """使用模块级函数验证 job 确实写入 SQLite。"""
+    import sqlite3
+    db_path = tmp_path / "test.db"
+    with patch.dict(os.environ, {"SCHEDULER_DB_PATH": str(db_path)}):
+        import importlib
+        import services.scheduler as mod
+        importlib.reload(mod)
+        await mod.start()
+
+        run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        job_id = mod.add_job(_module_level_noop, run_at, job_id="sqlite-test-job")
+
+        # 验证 SQLite 文件存在且包含该 job
+        assert db_path.exists(), "SQLite 文件应该被创建"
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.execute("SELECT id FROM apscheduler_jobs WHERE id = ?", ("sqlite-test-job",))
+        row = cursor.fetchone()
+        conn.close()
+        assert row is not None, "job 应写入 SQLite"
 
         await mod.stop()
