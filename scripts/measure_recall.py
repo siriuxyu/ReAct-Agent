@@ -41,7 +41,7 @@ DEFAULT_CHROMA_PATH = Path(
 ).expanduser()
 DEFAULT_LOCOMO_PATH = REPO_ROOT / "benchmark" / "locomo1.json"
 DEFAULT_CONVERTED_PATH = REPO_ROOT / "benchmark" / "locomo1_converted.json"
-COLLECTION_NAME = "langmem_memories"
+COLLECTION_NAME = "agent_memories"
 CATEGORY_NAMES = {
     1: "Identity/Profile",
     2: "Temporal",

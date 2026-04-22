@@ -4,7 +4,7 @@ LoCoMo simplified memory benchmark runner.
 
 For each persona we:
 1) Send a single call that contains all of their conversation transcripts so the
-   agent can capture the long-term context (LangMem).
+   agent can capture the long-term context (memory).
 2) Reset short-term state and send a single call that contains all QA questions
    for that persona, asking the agent to answer them in JSON.
 

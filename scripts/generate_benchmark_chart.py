@@ -19,7 +19,7 @@ C_TEXT    = '#2C3E50'
 
 fig = plt.figure(figsize=(14, 9), facecolor=C_BG)
 fig.suptitle(
-    'ReAct Agent — Benchmark Performance',
+    'Cliriux Agent - Benchmark Performance',
     fontsize=17, fontweight='bold', color=C_TEXT, y=0.97
 )
 
@@ -114,7 +114,7 @@ metrics = [
     ('Tool-Call Accuracy', '100%',  'Short / Medium / Long'),
     ('Long-context Quality', '+114.3%', 'vs Phase 1 baseline'),
     ('LoCoMo Recall',       '85.2%', '19 sessions / 419 turns'),
-    ('Memory System',       'LangMem\n+ ChromaDB', '1536-dim OpenAI Embeddings'),
+    ('Memory System',       'Vector Store\n+ ChromaDB', '1536-dim OpenAI Embeddings'),
     ('Context Compression', '≤ 14 turns', 'Auto-summarise old messages'),
 ]
 
