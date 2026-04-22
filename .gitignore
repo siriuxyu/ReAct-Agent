@@ -21,3 +21,4 @@ locomo_*_results.json
 # Benchmark datasets are downloaded on demand; eval artifacts are local only.
 benchmark/*.json
 benchmark/eval_results/
+.worktrees/
