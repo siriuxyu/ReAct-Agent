@@ -87,3 +87,18 @@ def test_no_auth_returns_message(mock_creds):
         "max_results": 5,
     })
     assert "auth" in result.lower() or "授权" in result
+
+
+@patch("tools.calendar.get_credentials")
+@patch("tools.calendar.build")
+def test_update_calendar_event(mock_build, mock_creds):
+    mock_build.return_value = _make_service()
+    from tools.calendar import update_calendar_event
+    result = update_calendar_event.invoke({
+        "event_id": "evt-123",
+        "title": "Updated Meeting",
+        "start": None,
+        "end": None,
+        "description": None,
+    })
+    assert "evt-123" in result or "Updated" in result

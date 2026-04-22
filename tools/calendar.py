@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from datetime import datetime, timedelta
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
@@ -93,26 +94,26 @@ def list_calendar_events(time_min: str, time_max: str, max_results: int = 10) ->
 
 class UpdateEventInput(BaseModel):
     event_id: str = Field(..., description="事件 ID")
-    title: str = Field(None, description="新标题（留空不修改）")
-    start: str = Field(None, description="新开始时间，ISO 8601（留空不修改）")
-    end: str = Field(None, description="新结束时间，ISO 8601（留空不修改）")
-    description: str = Field(None, description="新描述（留空不修改）")
+    title: Optional[str] = Field(None, description="新标题（留空不修改）")
+    start: Optional[str] = Field(None, description="新开始时间，ISO 8601（留空不修改）")
+    end: Optional[str] = Field(None, description="新结束时间，ISO 8601（留空不修改）")
+    description: Optional[str] = Field(None, description="新描述（留空不修改）")
 
 
 @tool("update_calendar_event", args_schema=UpdateEventInput)
-def update_calendar_event(event_id: str, title: str = None, start: str = None,
-                          end: str = None, description: str = None) -> str:
+def update_calendar_event(event_id: str, title: Optional[str] = None, start: Optional[str] = None,
+                          end: Optional[str] = None, description: Optional[str] = None) -> str:
     """修改 Google Calendar 中已有事件的标题、时间或描述。"""
     try:
         svc = _service()
     except NeedsAuthorizationError:
         return _AUTH_MSG
     patch_body: dict = {}
-    if title:
+    if title is not None:
         patch_body["summary"] = title
-    if start:
+    if start is not None:
         patch_body["start"] = {"dateTime": start}
-    if end:
+    if end is not None:
         patch_body["end"] = {"dateTime": end}
     if description is not None:
         patch_body["description"] = description

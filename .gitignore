@@ -22,3 +22,6 @@ locomo_*_results.json
 benchmark/*.json
 benchmark/eval_results/
 .worktrees/
+auth/token.json
+credentials.json
+scheduler.db

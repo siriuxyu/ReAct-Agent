@@ -1,5 +1,6 @@
 import os
 import secrets
+import time
 from pathlib import Path
 
 from google.oauth2.credentials import Credentials
@@ -14,7 +15,7 @@ _REDIRECT_URI = lambda: os.environ.get(
     "OAUTH_REDIRECT_URI", "http://localhost:8000/auth/google/callback"
 )
 
-_pending_flows: dict[str, Flow] = {}
+_pending_flows: dict[str, tuple] = {}  # state -> (flow, created_at)
 
 
 class NeedsAuthorizationError(Exception):
@@ -36,6 +37,10 @@ def get_credentials() -> Credentials:
 
 
 def get_auth_url() -> tuple[str, str]:
+    now = time.time()
+    expired = [s for s, (_, t) in _pending_flows.items() if now - t > 600]
+    for s in expired:
+        _pending_flows.pop(s, None)
     flow = Flow.from_client_secrets_file(
         _CREDENTIALS_FILE(), scopes=SCOPES, redirect_uri=_REDIRECT_URI()
     )
@@ -43,12 +48,12 @@ def get_auth_url() -> tuple[str, str]:
     auth_url, _ = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", state=state, prompt="consent"
     )
-    _pending_flows[state] = flow
+    _pending_flows[state] = (flow, now)
     return auth_url, state
 
 
 def exchange_code(code: str, state: str) -> Credentials:
-    flow = _pending_flows.pop(state, None)
+    flow, _ = _pending_flows.pop(state, (None, None))
     if flow is None:
         raise ValueError(f"Unknown OAuth state: {state}")
     flow.fetch_token(code=code)
