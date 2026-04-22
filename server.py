@@ -18,6 +18,7 @@ from agent.memory.memory_manager import (
 )
 from langchain_core.messages import ToolMessage, AIMessage
 import auth.google_oauth as _google_oauth
+import services.scheduler as _scheduler_svc
 
 # Import LangGraph errors for proper handling
 try:
@@ -161,9 +162,11 @@ async def _session_sweep_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(_session_sweep_loop())
+    await _scheduler_svc.start()
     try:
         yield
     finally:
+        await _scheduler_svc.stop()
         task.cancel()
         try:
             await task
