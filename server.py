@@ -17,6 +17,7 @@ from agent.memory.memory_manager import (
     is_storage_available,
 )
 from langchain_core.messages import ToolMessage, AIMessage
+import auth.google_oauth as _google_oauth
 
 # Import LangGraph errors for proper handling
 try:
@@ -297,6 +298,27 @@ def _get_session_state(session_id: str) -> Any:
 
 def _session_exists(session_id: str) -> bool:
     return _has_session_messages(_get_session_state(session_id))
+
+
+########################################################
+# Google OAuth endpoints
+########################################################
+@api.get("/auth/google")
+async def auth_google_start():
+    """引导用户授权 Google Calendar。"""
+    url, _state = _google_oauth.get_auth_url()
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=url, status_code=307)
+
+
+@api.get("/auth/google/callback")
+async def auth_google_callback(code: str, state: str):
+    """OAuth 回调，交换授权码为 token。"""
+    try:
+        _google_oauth.exchange_code(code, state)
+        return {"message": "Authorization successful. You can close this tab."}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 ########################################################
