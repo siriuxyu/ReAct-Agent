@@ -6,12 +6,15 @@ import asyncio
 import sys
 import os
 
+import pytest
+
 # Add parent directory to path to import modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from graph import graph
-from context import Context
+from agent.graph import graph
+from agent.context import Context
 
+@pytest.mark.asyncio
 async def test_translation():
     """Test the translation tool"""
     
@@ -26,6 +29,7 @@ async def test_translation():
     
     async for chunk in graph.astream(
         {"messages": [{"role": "user", "content": test_message}]},
+        config={"configurable": {"thread_id": "test_translation"}},
         context=Context(system_prompt="You are a helpful AI assistant.")
     ):
         print("Chunk:", chunk)

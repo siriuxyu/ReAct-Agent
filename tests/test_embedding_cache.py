@@ -13,6 +13,7 @@ def test_embed_text_cache_hit_skips_api():
     svc.dimension = 1536
     svc._cache = {}
     svc._cache_size = 1024
+    svc._redis = None
 
     fake_embedding = [0.1] * 1536
     mock_client = AsyncMock()
@@ -39,6 +40,7 @@ def test_embed_text_cache_miss_calls_api():
     svc.dimension = 1536
     svc._cache = {}
     svc._cache_size = 1024
+    svc._redis = None
 
     fake_a = [0.1] * 1536
     fake_b = [0.2] * 1536
@@ -68,6 +70,7 @@ def test_embed_text_cache_eviction():
     svc.dimension = 1536
     svc._cache = {}
     svc._cache_size = 2  # tiny cache
+    svc._redis = None
 
     def make_response(val):
         return AsyncMock(data=[AsyncMock(embedding=[val] * 1536)])

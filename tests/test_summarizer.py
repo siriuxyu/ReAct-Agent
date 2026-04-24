@@ -3,53 +3,36 @@ import pytest
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 
+def _make_long_msgs(count: int, chars_per_msg: int = 40) -> list:
+    """Create messages long enough to accumulate tokens quickly."""
+    return [HumanMessage(content="x" * chars_per_msg) for _ in range(count)]
+
+
 def test_needs_compression_true():
-    from agent.summarizer import needs_compression
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(15)]
+    from agent.summarizer import needs_compression, TARGET_MAX_TOKENS
+    # Each 40-char msg is ~10 tokens. Need > TARGET_MAX_TOKENS / 10 messages.
+    needed = TARGET_MAX_TOKENS // 10 + 2
+    msgs = _make_long_msgs(needed, chars_per_msg=40)
     assert needs_compression(msgs) is True
 
 
 def test_needs_compression_false():
     from agent.summarizer import needs_compression
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(10)]
+    msgs = [HumanMessage(content="short") for _ in range(10)]
     assert needs_compression(msgs) is False
 
 
-def test_needs_compression_boundary():
-    from agent.summarizer import needs_compression, COMPRESSION_THRESHOLD
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(COMPRESSION_THRESHOLD)]
-    assert needs_compression(msgs) is False  # exactly at threshold — no compression
-    msgs.append(HumanMessage(content="one more"))
-    assert needs_compression(msgs) is True
-
-
-def test_split_messages_returns_correct_lengths():
-    from agent.summarizer import split_messages
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(20)]
-    old, recent = split_messages(msgs, keep_recent=6)
-    assert len(recent) == 6
-    assert len(old) == 14
-    assert recent == msgs[-6:]
-
-
-def test_split_messages_smaller_than_keep():
-    from agent.summarizer import split_messages
-    msgs = [HumanMessage(content="only")]
-    old, recent = split_messages(msgs, keep_recent=6)
-    assert old == []
-    assert recent == msgs
-
-
-def test_compress_messages_produces_summary_prefix():
-    """compress_messages must return a list starting with a SystemMessage summary."""
-    from agent.summarizer import compress_messages, KEEP_RECENT
+def test_compress_messages_produces_summary():
+    """compress_messages must insert a SystemMessage summary in the middle."""
+    from agent.summarizer import compress_messages, TARGET_MAX_TOKENS
     from unittest.mock import AsyncMock, patch
 
-    # Use more messages than KEEP_RECENT so old messages exist to summarize
+    # Create enough long messages to trigger compression
+    needed = TARGET_MAX_TOKENS // 10 + 5
     msgs = (
         [HumanMessage(content="I am Alice, a nurse from Boston."),
          AIMessage(content="Nice to meet you Alice!")]
-        + [HumanMessage(content=f"filler {i}") for i in range(KEEP_RECENT)]
+        + _make_long_msgs(needed, chars_per_msg=40)
     )
 
     fake_summary = "Alice is a nurse from Boston."
@@ -59,20 +42,23 @@ def test_compress_messages_produces_summary_prefix():
     mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
     with patch("agent.summarizer.load_chat_model", return_value=mock_llm):
-        result = asyncio.run(
-            compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001")
-        )
+        result = asyncio.run(compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001"))
 
-    assert isinstance(result[0], SystemMessage)
-    assert fake_summary in result[0].content
+    # Find the summary SystemMessage in the result
+    summary_msgs = [m for m in result if isinstance(m, SystemMessage)]
+    assert len(summary_msgs) == 1
+    assert fake_summary in summary_msgs[0].content
 
 
-def test_compress_messages_keeps_recent():
-    """The last KEEP_RECENT messages must be preserved verbatim."""
-    from agent.summarizer import compress_messages, KEEP_RECENT
+def test_compress_messages_keeps_tail():
+    """Tail messages must be preserved verbatim after compression."""
+    from agent.summarizer import compress_messages, TARGET_MAX_TOKENS, PROTECT_TAIL
     from unittest.mock import AsyncMock, patch
 
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(KEEP_RECENT + 4)]
+    needed = TARGET_MAX_TOKENS // 10 + 5
+    tail_content = "tail-msg"
+    msgs = _make_long_msgs(needed, chars_per_msg=40)
+    msgs[-1] = HumanMessage(content=tail_content)
 
     mock_response = AsyncMock()
     mock_response.content = "summary"
@@ -80,28 +66,25 @@ def test_compress_messages_keeps_recent():
     mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
     with patch("agent.summarizer.load_chat_model", return_value=mock_llm):
-        result = asyncio.run(
-            compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001")
-        )
+        result = asyncio.run(compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001"))
 
-    # Result: [SystemMessage] + last KEEP_RECENT messages
-    assert len(result) == KEEP_RECENT + 1
-    assert result[1:] == msgs[-KEEP_RECENT:]
+    # The last PROTECT_TAIL messages should include our tail_content
+    tail_texts = [m.content for m in result[-PROTECT_TAIL:] if hasattr(m, "content")]
+    assert tail_content in tail_texts
 
 
 def test_compress_messages_fallback_on_error():
     """If LLM call fails, return the original messages unchanged."""
-    from agent.summarizer import compress_messages
+    from agent.summarizer import compress_messages, TARGET_MAX_TOKENS
     from unittest.mock import AsyncMock, patch
 
-    msgs = [HumanMessage(content=f"msg {i}") for i in range(10)]
+    needed = TARGET_MAX_TOKENS // 10 + 5
+    msgs = _make_long_msgs(needed, chars_per_msg=40)
 
     mock_llm = AsyncMock()
     mock_llm.ainvoke = AsyncMock(side_effect=Exception("LLM error"))
 
     with patch("agent.summarizer.load_chat_model", return_value=mock_llm):
-        result = asyncio.run(
-            compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001")
-        )
+        result = asyncio.run(compress_messages(msgs, model="anthropic/claude-haiku-4-5-20251001"))
 
     assert result == msgs

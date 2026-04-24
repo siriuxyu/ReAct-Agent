@@ -129,7 +129,7 @@ def test_measure_recall_refuses_rebuild_existing_user_without_explicit_flag(monk
         asyncio.run(
             ensure_chroma_ready(
                 chroma_path=tmp_path / "chroma",
-                collection_name="langmem_memories",
+                collection_name="agent_memories",
                 user_id="memory_test_conv-26",
                 converted_path=tmp_path / "missing.json",
                 turns_per_chunk=3,
