@@ -765,7 +765,7 @@ The resume section should be updated to reflect:
 
 ```latex
 \item \textbf{开发高性能 React 智能体 (Agent)}：利用 \textbf{LangGraph} 构建三节点
-(call\_model / tools / extract\_preferences) 状态机与 ReAct 循环，
+(call\_model / tools / extract\_preferences) 状态机与 Cliriux 循环，
 实现动态工具加载（6 类内置工具 + 用户专属记忆工具）；集成\textbf{上下文压缩}
 （对话超过 14 轮时自动摘要旧消息）；部署为 \textbf{FastAPI} 服务（9 个 REST 端点），
 短/中/长三档 benchmark 工具调用准确率均达 \textbf{100\%}。
